@@ -1,15 +1,18 @@
 import asyncio
 import hashlib
+import os
 import secrets
+import shlex
 import socket
 import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import uvicorn
@@ -20,7 +23,7 @@ from mcp import ClientSession
 from mcp.types import NotificationParams, PaginatedRequestParams, RequestParams
 
 from scripts.reset_dev_state import ResetError, reset_dev_state
-from services.gateway import auth
+from services.gateway import auth, upstream_client
 from services.gateway.config import settings
 from services.gateway.db import engine
 from services.gateway.main import app
@@ -29,6 +32,41 @@ from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
 ECHO_SERVER = Path(__file__).parent / "fixtures" / "echo_server.py"
 
 SIGNED_SECRET_ENV = "PORTUNUSMCP_TEST_SIGNING_SECRET"
+
+
+def server_spec(command: str, image: str = "portunusmcp:dev") -> dict[str, object]:
+    return {"image": image, "command": shlex.split(command)}
+
+
+class LocalRuntime:
+    """Fast test-only launcher; production has no local-process setting or fallback."""
+
+    namespace = "test"
+
+    async def preflight(self, servers: object) -> None:
+        pass
+
+    async def spawn(
+        self, server: object, session_id: str, server_id: str
+    ) -> upstream_client.ContainerProcess:
+        command = server.command  # type: ignore[attr-defined]
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            limit=4 * 1024 * 1024,
+            env=os.environ.copy(),
+        )
+        return upstream_client.ContainerProcess(process=process, name=f"local-{session_id}")
+
+    async def stop(self, container: upstream_client.ContainerProcess, grace_seconds: int) -> None:
+        if container.returncode is None:
+            container.process.terminate()
+            try:
+                await asyncio.wait_for(container.wait(), timeout=grace_seconds)
+            except TimeoutError:
+                container.process.kill()
+                await container.wait()
 
 
 class SignedSession(ClientSession):
@@ -105,7 +143,7 @@ def policy_dict(
 ) -> dict:
     return {
         "version": version,
-        "servers": {"default": f"{sys.executable} {ECHO_SERVER}"},
+        "servers": {"default": server_spec(f"{sys.executable} {ECHO_SERVER}")},
         "identities": [
             {
                 "id": "agent-readonly",
@@ -145,15 +183,24 @@ def write_signing_keypair(directory: Path) -> tuple[Path, Path]:
 
 @asynccontextmanager
 async def running_gateway(
-    policy_path: Path, upstream_command: str, keys: dict[str, str]
+    policy_path: Path,
+    upstream_command: str,
+    keys: dict[str, str],
+    *,
+    isolate_upstreams: bool = False,
 ) -> AsyncIterator[Gateway]:
     """The gateway app on an ephemeral port with the given policy file and upstream.
     A policy without a `servers:` block (the single-server fixtures) gets the given
     command registered as "default" — item 35's registry, transparently."""
     policy = yaml.safe_load(policy_path.read_text())
     if "servers" not in policy:
-        policy["servers"] = {"default": upstream_command}
-        policy_path.write_text(yaml.safe_dump(policy))
+        policy["servers"] = {"default": server_spec(upstream_command)}
+    else:
+        policy["servers"] = {
+            server_id: server_spec(server) if isinstance(server, str) else server
+            for server_id, server in policy["servers"].items()
+        }
+    policy_path.write_text(yaml.safe_dump(policy))
     old_policy_file = settings.policy_file
     old_signing_key = settings.signing_key_file
     old_signing_pub = settings.signing_public_key_file
@@ -167,20 +214,32 @@ async def running_gateway(
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
+    runtime = LocalRuntime()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
-    task = asyncio.create_task(server.serve())
-    while not server.started:
-        await asyncio.sleep(0.05)
+    runtime_patch = (
+        nullcontext()
+        if isolate_upstreams
+        else patch.object(
+            upstream_client.DockerRuntime, "create", new=AsyncMock(return_value=runtime)
+        )
+    )
+    with runtime_patch:
+        task = asyncio.create_task(server.serve())
+        while not server.started:
+            if task.done():
+                await task
+                raise RuntimeError("gateway stopped during startup")
+            await asyncio.sleep(0.05)
 
-    try:
-        yield Gateway(url=f"http://127.0.0.1:{port}", keys=keys, policy_path=policy_path)
-    finally:
-        settings.policy_file = old_policy_file
-        settings.signing_key_file = old_signing_key
-        settings.signing_public_key_file = old_signing_pub
-        settings.policy_revisions_dir = old_revisions_dir
-        server.should_exit = True
-        await task
+        try:
+            yield Gateway(url=f"http://127.0.0.1:{port}", keys=keys, policy_path=policy_path)
+        finally:
+            settings.policy_file = old_policy_file
+            settings.signing_key_file = old_signing_key
+            settings.signing_public_key_file = old_signing_pub
+            settings.policy_revisions_dir = old_revisions_dir
+            server.should_exit = True
+            await task
 
 
 @pytest.fixture

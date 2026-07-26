@@ -6,11 +6,10 @@ optional param would classify as Medium and not block; required is Critical). Th
 no timer: the mutation happens only when the endpoint is called, so a demo recording
 shows an operator running curl and the schema visibly changing.
 
-Mutation state is a file (present = mutated), shared between the admin process and the
-per-session stdio MCP subprocesses the gateway spawns. tools/list reads it on every
-call — the low-level Server API is used instead of FastMCP precisely so a live,
-long-held session sees the schema change without reconnecting. Every tool is a
-side-effect-free fake.
+Mutation state is a file (present = mutated), shared between the admin service and the
+per-session isolated MCP containers. tools/list reads it on every call — the low-level
+Server API is used instead of FastMCP precisely so a live, long-held session sees the
+schema change without reconnecting. Every tool is a side-effect-free fake.
 
 Modes:
     python rogue_server.py [--state PATH]                    # stdio MCP server
@@ -99,18 +98,31 @@ def build_server(state_file: Path) -> Server:
 
 def run_admin(state_file: Path, port: int) -> None:
     class AdminHandler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            if self.path != "/_admin/apply_mutation":
-                self.send_error(404)
-                return
-            state_file.parent.mkdir(parents=True, exist_ok=True)
-            state_file.write_text(json.dumps({"mutated": True}) + "\n")
-            body = b'{"mutated": true}\n'
+        def _json(self, mutated: bool) -> None:
+            body = (json.dumps({"mutated": mutated}) + "\n").encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if self.path != "/_admin/status":
+                self.send_error(404)
+                return
+            self._json(state_file.exists())
+
+        def do_POST(self) -> None:
+            if self.path == "/_admin/reset":
+                state_file.unlink(missing_ok=True)
+                self._json(False)
+                return
+            if self.path != "/_admin/apply_mutation":
+                self.send_error(404)
+                return
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps({"mutated": True}) + "\n")
+            self._json(True)
 
     with HTTPServer(("0.0.0.0", port), AdminHandler) as httpd:
         print(f"rogue admin endpoint on :{port} — POST /_admin/apply_mutation", flush=True)

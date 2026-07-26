@@ -10,14 +10,14 @@ Core design of PortunusMCP: the decision pipeline, every component, failure beha
 
 ### 4.1 High-level flow
 
-The client-facing transport is **Streamable HTTP** (the MCP spec deprecated the standalone SSE transport in 2025-03); the upstream side is a stdio subprocess per session (see §4.8, Session Manager).
+The client-facing transport is **Streamable HTTP** (the MCP spec deprecated the standalone SSE transport in 2025-03); the upstream side is stdio to a dedicated hardened Docker container per session (see §4.8, Session Manager, and ADR-007).
 
 ```mermaid
 sequenceDiagram
     participant Client as MCP Client (Streamable HTTP)
     participant Gateway as PortunusMCP Gateway
     participant Audit as Audit Log (Postgres)
-    participant Server as Upstream MCP Server (stdio)
+    participant Server as Isolated upstream container (stdio)
 
     Client->>Gateway: initialize (capabilities)
     Gateway->>Server: initialize (forwarded)
@@ -138,8 +138,9 @@ graph TD
         Simulator["Policy Simulator (admin API)"]
     end
 
-    UpClient --> SrvA["MCP Server A (stdio subprocess, per session)"]
-    UpClient --> SrvB["MCP Server B (stdio subprocess, per session)"]
+    UpClient --> Docker["Local Docker daemon (Unix socket)"]
+    Docker --> SrvA["MCP Server A container (per session)"]
+    Docker --> SrvB["MCP Server B container (per session)"]
 
     Replay --> Redis[("Redis: nonces, schema cache, risk counters, session TTL")]
     Risk --> Redis
@@ -161,31 +162,32 @@ Edges elided for readability: Auth bumps the gateway-wide auth-failure counter i
 
 ### 4.5 Deployment diagrams
 
-**(a) MVP — Docker Compose (what this repo runs today).** Five services on one host; the upstream MCP server is *not* a compose service — it's a stdio subprocess spawned per session inside the gateway container (registered in the policy's `servers:` block, item 35). The `rogue` service exists only to host the demo's mutation endpoint; the rogue MCP server itself also runs as stdio subprocesses inside the gateway.
+**(a) MVP — Docker Compose (what this repo runs today).** The gateway mounts the local Unix Docker socket and launches one sibling upstream container per session from the typed policy registry. The `rogue` service exists only to host the demo's mutation endpoint and reset/status surface; the actual rogue MCP server runs in the same isolated per-session container model.
 
 ```mermaid
 graph TD
     C["MCP client (host)"] -->|"Streamable HTTP :8000"| G
 
     subgraph Compose["Docker Compose, single host"]
-        subgraph GWC["gateway container"]
-            G["PortunusMCP Gateway (FastAPI)"]
-            U["stdio upstream subprocess, one per session"]
-            G --> U
-        end
+        G["gateway container (FastAPI + Docker CLI)"]
         PG[("postgres:16  :5432")]
         R[("redis:7  :6379")]
         V["verifier sidecar (audit_verifier_daemon, read-only)"]
         RG["rogue admin service :9800 (demo only)"]
     end
 
+    G -->|"Unix Docker socket"| D["Docker daemon"]
+    D --> U["hardened upstream container, one per session"]
+    G -->|"stdio via docker attach"| U
     G --> PG
     G --> R
     V --> PG
-    RG -.->|"shared .rogue-state bind mount"| G
+    RG -.->|"namespaced named volume"| U
 ```
 
-Volume posture, security-relevant: `./policies` is mounted **read-only** into the gateway (a compromised gateway can't persist a policy backdoor), with only the `./policies/revisions` submount writable for activation snapshots; `./secrets` is read-only, and the verifier container mounts it only to read the **public** key — the signing private key is never given to any other service.
+Volume posture, security-relevant: `./policies` is mounted **read-only** into the gateway, with only `./policies/revisions` writable for activation snapshots; `./secrets` is read-only in the gateway, while the verifier mounts only the public-key file. Upstream named volumes must start with `portunusmcp-upstream-<namespace>-`, are mounted read-only, and cannot target `/app/secrets`, `/var/run/docker.sock`, or descendants.
+
+The gateway's Docker socket is intentionally **root-equivalent access to the host**. It creates the boundary between upstreams and gateway secrets, but means a shell compromise of the gateway is a host compromise. `DOCKER_GID` grants the gateway process socket access explicitly; this is an operator trust decision, not a sandbox.
 
 **(b) Production target (Phase 4, not built).**
 
@@ -205,9 +207,7 @@ graph TD
     G3 --> Servers
 ```
 
-Every gateway replica is stateless and reads/writes the same Redis and Postgres instances — replay nonces, schema cache, risk counters, and session-liveness keys are all in Redis; audit chain, policy versions, drift baselines, and approvals are all in Postgres — so adding replicas behind the load balancer is the entire scaling story for **network-connected (Streamable HTTP) upstream servers**; no session affinity or local cache required. See section 10 for the write-amplification caveat this introduces on the Postgres side.
-
-> **Explicit scoping — the stdio/multi-replica conflict, resolved:** a `stdio`-connected upstream server is spawned as a child subprocess by whichever gateway replica first handles that session; it is not visible to, or shareable with, any other replica. If a client's requests are load-balanced across replicas (the default behavior of an ALB with no affinity configured), a `stdio` server's subprocess on Replica 1 is simply unreachable from Replica 2. This is a real constraint, not an edge case, so it's stated plainly rather than left implied by "stateless replicas": **multi-replica, load-balanced deployment is supported only for network-connected upstream servers.** Any deployment that needs a `stdio`-connected server must either (a) configure sticky sessions at the load balancer so a given client always lands on the replica that owns its subprocess, or (b) run the gateway as a single instance for that server. This is documented as a hard deployment constraint, not a future fix — it follows directly from what a local subprocess is. (The Compose MVP above sidesteps it entirely: one gateway instance, so every stdio subprocess is local by construction.)
+This network-upstream diagram remains a future target, not the current deployment. Today's Session Manager and container handles are in memory, and the audit chain is single-writer, so the supported local-container deployment is one gateway replica. Remote Streamable-HTTP upstreams and true multi-replica operation remain explicitly deferred.
 
 ### 4.6 Data flow diagram (single request, all stages)
 
@@ -249,17 +249,16 @@ graph TD
 - **Team-owned vs org-owned servers**: an internal platform team's server that went through security review shouldn't be scored identically to a side-project server someone registered for their own agent — yet today the only lever is enumerating tools per `server_id`, which encodes *authorization*, not *confidence*.
 - **Drift history as a trust signal**: a server whose schema has mutated five times this month is inherently less trustworthy than one stable for a year. The item-18 drift-history risk factor already implements exactly this signal *per tool*; a trust tier is the same idea lifted to the server as a whole.
 
-**The extension point: `trust_tier` on server registration.** When multi-server support grows a real registration record, it would carry an admin-assigned tier (with an optional numeric score for the Risk Engine), sketched here as policy YAML — **this key is not implemented; the policy loader will reject it today**:
+**The extension point: `trust_tier` on server registration.** The typed server registry could later carry an admin-assigned tier (with an optional numeric score for the Risk Engine), sketched here as policy YAML — **these keys are not implemented; the policy loader rejects them today**:
 
 ```yaml
 # SKETCH ONLY — not implemented; shown as the designed extension point.
 servers:
-  - server_id: "github-mcp"
+  github-mcp:
+    image: "ghcr.io/acme/github-mcp@sha256:..."
+    command: ["github-mcp"]
     trust_tier: "org-verified"     # org-verified | team-owned | third-party
     trust_score: 90                # 0-100, admin-assigned; drift history could decay it
-  - server_id: "community-scraper"
-    trust_tier: "third-party"
-    trust_score: 40
 ```
 
 Two consumers, both fitting mechanisms that already exist:
@@ -267,13 +266,15 @@ Two consumers, both fitting mechanisms that already exist:
 1. **Risk Engine factor.** A `server_trust` factor is one more `evaluate(ctx) -> RiskFactor` function appended to the fixed factor list (§4.8) — low trust contributes weight, high trust contributes nothing; no engine change. The same `delete_repo` call then scores higher through the community server than through the org-verified one, and can cross the CHALLENGE or approval threshold on that difference alone. Decay rules would mirror item 18's boundary: an admin approving one call must not erase a server's instability record, so `server_trust` would be non-decayable like `drift_history`.
 2. **Policy scoping by tier.** Grants could say `conditions: ["server.trust_tier == 'org-verified'"]` (a third attribute root alongside `identity.*`/`context.*`/`risk.*` — an evaluator vocabulary addition, not a language change) instead of enumerating `server_id`s. This matters operationally once registered servers outgrow hand-enumeration: "read-only tools on any third-party server, write tools only on org-verified ones" is one rule, not one per server.
 
-**Explicit non-goals for v1:** no per-server trust scoring in code, no `trust_tier`/`trust_score` in the policy schema or loader, no multi-server registry or routing layer, no automatic tier derivation from drift history. Multi-server trust scoring is tracked as documented-only future work in `ROADMAP.md` item 29, alongside the other deliberate deferrals (OPA/Cedar migration, OAuth/OBO). What this section commits to is only the shape of the extension — so if the project grows into it, trust lands as one risk factor plus one attribute root, not a redesign.
+**Explicit non-goals for v1:** no per-server trust scoring, no `trust_tier`/`trust_score`, and no automatic tier derivation from drift history. Multi-server registration/routing exists; trust tiers remain documented-only future work in `ROADMAP.md` item 29.
 
 ### 4.8 Component responsibilities
 
-**Session Manager** — owns the lifecycle of one client↔gateway↔server session. Assigns a session ID, tracks negotiated capabilities, holds a reference to the upstream connection (stdio subprocess or SSE stream), and tears everything down cleanly on disconnect so no process or credential leaks across sessions. Each session is isolated: no shared state, no shared subprocess.
+**Session Manager** — owns one client↔gateway↔server session. After the fail-closed `SESSION_START` write, it asks `DockerRuntime` to launch the registered container and holds the attached stdio handle. Disconnect, idle expiry, upstream exit/resource exhaustion, and gateway shutdown all stop and remove the container. Each session has its own container and runtime fingerprint.
 
-**Subprocess shutdown handling, explicit:** per-session teardown on disconnect covers the normal case, but it doesn't cover a process-level shutdown signal — if Docker/Compose sends `SIGTERM` to the gateway container while `stdio` child processes are running, those subprocesses don't automatically die with their parent and can be left as zombies or orphans (`asyncio.create_subprocess_exec` gives no such guarantee by itself). The Session Manager therefore maintains a registry of all currently-active subprocess handles, and the gateway hooks into FastAPI's `lifespan` context manager (equivalently, a `signal.signal(SIGTERM, ...)` handler) to walk that registry on shutdown: call `.terminate()` on every active subprocess, wait a short grace period (default 5s), then `.kill()` anything still alive before the gateway process itself exits. **The handler is defensive against processes that are already gone:** if a subprocess in the registry has already exited on its own (e.g. the upstream server crashed independently, or the OS already reaped it), calling `.terminate()` on it can raise `ProcessLookupError` or `OSError`; the shutdown loop explicitly catches and swallows these per-subprocess, logs the attempt, and continues to the next entry — an uncaught exception here would abort the loop partway through and leave every *subsequent* subprocess in the registry uncleaned, which is precisely the failure mode this handler exists to prevent. This matters most during local development and CI, where the gateway container restarts frequently — without it, repeated restarts silently accumulate orphaned processes over a session.
+**Container lifecycle and policy activation:** `DockerRuntime` accepts only a local Unix Docker daemon. Startup removes containers carrying this gateway namespace's management labels, then preflights every configured image and namespaced volume; any failure aborts startup before policy activation. SIGHUP performs the same preflight before swapping policy and keeps the last-known-good policy on failure. Rollback returns HTTP 409 if its historical runtime is unavailable. After a successful reload or rollback, the Session Manager disconnects only sessions whose runtime fingerprint changed; cleanup errors are logged but never stop the remaining disconnects.
+
+The fixed launch posture is UID 65532, read-only root, 16 MiB `noexec,nosuid,nodev` `/tmp`, init, `no-new-privileges`, all capabilities dropped, `--pull never`, and memory/CPU/PID limits (defaults 256 MiB, 0.5 CPU, 64 PIDs; memory swap equals memory). Network is `none` unless `bridge` is explicit. Policy `env` maps container destinations to host-variable sources prefixed `PORTUNUSMCP_UPSTREAM_`; no ambient gateway environment is inherited. Named volumes are namespace-bound and read-only. See ADR-007.
 
 **JSON-RPC Interceptor** — the dispatch core. Every inbound JSON-RPC message is parsed, its `method` field is matched against a handler (`initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, etc.), and routed. Any method not explicitly handled is passed through unmodified but still logged — deny-by-default is not enforced universally on day one (would break legitimate use), but every unhandled method is visible in the audit trail for review.
 
@@ -281,6 +282,14 @@ Two consumers, both fitting mechanisms that already exist:
 
 ```yaml
 version: 4
+servers:
+  github-mcp:
+    image: "ghcr.io/acme/github-mcp@sha256:..."
+    command: ["github-mcp", "--stdio"]
+    env:
+      GITHUB_TOKEN: PORTUNUSMCP_UPSTREAM_GITHUB_TOKEN
+    network: none
+    resources: {memory_mb: 256, cpus: 0.5, pids: 64}
 identities:
   - id: "agent-readonly-01"
     api_key_hash: "sha256:..."
@@ -393,7 +402,7 @@ runs the same evaluation path *without* actually forwarding the call — useful 
 
 A rolling Redis counter tracks failed lookups — wrong bearer keys, unknown key ids, bad signatures — feeding the Risk Engine's auth-failure signal above. No session cookies, no JWTs for v1. OAuth 2.1 On-Behalf-Of token exchange stays a documented later item (this is where you'd map an upstream OAuth token per user identity so the gateway never holds a single shared credential).
 
-**Session idle timeout** — per-session teardown on a clean disconnect, and the SIGTERM subprocess-cleanup handler, both cover intentional shutdown paths. Neither covers a session that goes silent without disconnecting properly (a network drop, a crashed client) — that session's subprocess or SSE stream would otherwise sit alive indefinitely until something else notices. The fix: each session's last-activity timestamp is tracked as a Redis key with a TTL (`session:{id}:last_seen`, default 5 minutes, refreshed on every request); when the key expires, a lightweight sweep (a periodic task, not a per-request check) tears the session down exactly as it would on a clean disconnect — closing the subprocess/stream, releasing the session-manager registry entry. This is a small addition on top of infrastructure that already exists (Redis TTLs are already used for replay nonces and rate limiting) rather than a new mechanism.
+**Session idle timeout** — clean disconnect and gateway shutdown cover intentional paths; a Redis TTL (`session:{id}:last_seen`, default 5 minutes, refreshed on each request) covers silent clients. A lightweight sweep stops and removes the session's container when that key expires. Item 40 tracks the remaining in-flight-call refresh gap.
 
 **Audit Log** — every decision point (session start, tools/list served, DENY, ALLOW, CHALLENGE, APPROVAL_PENDING, drift detected at any severity, admin approval, policy activation) is written as an append-only row with a hash chain:
 
@@ -481,6 +490,7 @@ A security gateway that silently fails open under load or during an outage is wo
 | Postgres (audit log write) | **Fail closed** — deny the call before it reaches the upstream server | An action that can't be recorded is, for this project's purposes, an action that shouldn't happen — "no record, no action" is the defensible posture even though it costs availability. This is a deliberate trade-off, stated as such. |
 | Postgres (policy store, read-only lookup) | **Fail closed**, but backed by an in-memory last-known-good policy snapshot with a short grace period (default 60s) to absorb brief connection blips without denying everything during a transient reconnect | Distinguishes "database had a one-second hiccup" from "database is actually down," without pretending a stale policy is fine indefinitely. |
 | Risk Engine (unhandled exception during scoring) | **Fail closed** — treat the exception itself as maximum risk (equivalent to score 100, i.e. deny) | A crashed risk calculation is not the same as "risk is low"; treating a scoring failure as the worst-case score is the only interpretation that doesn't quietly disable the feature under fault conditions. |
+| Local Docker daemon, configured image, or configured named volume unavailable | **Fail closed** — startup aborts; SIGHUP keeps the last-known-good policy; rollback returns 409 | Activating a policy whose isolation runtime cannot be realized must never fall back to an in-process server or weaker launch posture. |
 | Upstream MCP server unreachable | **Fail closed** for that server only — return a JSON-RPC error for calls targeting it; does not affect other registered servers or other identities | This isn't a security decision so much as a normal proxy-availability one, included here for completeness. |
 | Audit verifier daemon itself down | **No blocking effect on live traffic** — the daemon is a detective control, not a preventive one; its own downtime is monitored separately (a missed-heartbeat alert), since blocking live traffic because a background verifier hasn't run recently would be a disproportionate availability cost for a control that's about catching tampering after the fact, not preventing the call. | |
 
@@ -493,7 +503,7 @@ The consistent theme: every subsystem whose failure would silently weaken a secu
 
 ## 6. Security Hardening Checklist
 
-- Run each upstream stdio server subprocess with dropped capabilities, no network egress unless explicitly allowlisted, and a non-root user.
+- **Implemented (item 39):** each upstream runs in a dedicated container as UID 65532 with a read-only root, restricted tmpfs, no new privileges, all capabilities dropped, bounded memory/CPU/PIDs, no swap above memory, a minimal allowlisted environment, and no network unless `bridge` is explicit.
 - Rate-limit per identity (Redis token bucket) on `tools/call` to blunt automated abuse.
 - Never log full argument payloads for tools flagged as handling secrets (policy field: `redact_args: true` per tool).
 - API keys stored only as salted hashes; raw keys shown once at creation time via admin CLI, never persisted in plaintext.
@@ -524,7 +534,7 @@ The gateway caches two things per `(server_id)`: the last-seen tool schema set (
 
 - **Schema cache:** invalidated and re-fetched on every `initialize` for a session (a fresh handshake is the natural trust boundary to re-verify against). Additionally carries a TTL (default 10 min) so a long-lived session doesn't trust a stale schema indefinitely between handshakes — on TTL expiry the gateway transparently re-issues `tools/list` upstream and re-runs the drift check before serving the next client request.
 - **ETags:** the gateway's own `tools/list` response to the client includes an ETag derived from `(policy_version, schema_hash)`; a client that supports conditional requests can skip re-parsing an unchanged tool list.
-- **Policy cache:** invalidated immediately on file-watch/SIGHUP reload (no TTL needed — policy changes are explicit operator actions, not upstream server behavior), and every in-flight session's next request re-resolves against the new version rather than finishing out the old one.
+- **Policy cache:** invalidated immediately on SIGHUP reload. The candidate container runtime is preflighted before swap; after success, sessions whose runtime fingerprint changed are disconnected while unchanged sessions continue and resolve calls against the new policy.
 
 ---
 
@@ -543,28 +553,29 @@ A proxy that adds meaningful latency to every tool call is a hard sell regardles
 - **gateway** = the same calls through one in-process gateway, with the full §4.2 pipeline active (Replay Guard → auth → RBAC + ABAC conditions → drift check → Risk Engine scoring across all eight factors, Redis-backed behavioral counters included → parameter validation → hash-chained audit write with per-row ECDSA P-256 signing).
 - **Overhead** = gateway − direct.
 - **Cold cache** deletes the Redis schema key before every timed call, forcing an upstream `tools/list` re-fetch plus drift check per call. The direct path has no cache, so its column repeats the baseline.
-- **Concurrency** levels run 20 calls per session against the single gateway process, each session owning its own upstream stdio subprocess.
+- **Container initialization** measures the first launch plus 20 warm launches. Concurrency levels run 20 calls per session at 10/50/100 sessions, each session owning a real hardened Docker container.
+- **Memory** records the gateway+harness process RSS and the aggregate initialized upstream-container memory after the 100-session run.
 
 It also measures the **`tools/list` response size reduction** from schema pruning. Every other metric here answers "how much overhead does the gateway add"; pruning is the one genuine positive claim — smaller wire responses and fewer tokens for the LLM parsing the tool list.
 
 ### Results
 
-Measured **2026-07-10** at commit **`902341f`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, Postgres 16 and Redis 7 in local Docker. Latencies are mean / p50 / p95 / p99.
+Measured **2026-07-26** from the item-39 working tree based on **`b180258`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, Postgres 16, Redis 7, and local Docker. Latencies are mean / p50 / p95 / p99.
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 1.38 / 1.33 / 1.56 / 1.94 ms | 13.47 / 12.95 / 16.12 / 24.46 ms | 12.09 / 11.62 / 14.56 / 22.51 ms |
-| Single call, cold schema cache | 1.38 / 1.33 / 1.56 / 1.94 ms | 16.62 / 16.17 / 19.51 / 24.71 ms | — |
-| 10 concurrent sessions (p95) | — | 160.20 ms | — |
-| 50 concurrent sessions (p95) | — | 565.46 ms | — |
-| 100 concurrent sessions (p95) | — | 1228.23 ms | — |
-| `tools/list` payload size (pruned identity) | 1506 B (unpruned) | 797 B | **47.1% reduction** |
+| Single call, cached schema | 0.34 / 0.23 / 0.66 / 1.32 ms | 12.87 / 12.25 / 15.49 / 23.45 ms | 12.53 / 12.02 / 14.83 / 22.13 ms |
+| Single call, cold schema cache | 0.34 / 0.23 / 0.66 / 1.32 ms | 15.34 / 14.39 / 18.46 / 39.97 ms | — |
+| 10 concurrent sessions (p95) | — | 163.04 ms | — |
+| 50 concurrent sessions (p95) | — | 1201.06 ms | — |
+| 100 concurrent sessions (p95) | — | 2974.65 ms | — |
+| `tools/list` payload size (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
 
-Peak RSS after the 100-session run: 220 MiB (gateway and benchmark harness share the process). The high-concurrency p95 is dominated by the synchronous fail-closed audit write contending on the Postgres pool and by the per-session stdio subprocess model — the known ceilings in §10.
+Container initialization: first 512.46 ms; next 20 p50 456.59 ms / p95 626.01 ms. Peak RSS after the 100-session run: 204 MiB (gateway and harness share the process); aggregate initialized upstream-container memory: 1,095 MiB. High-concurrency p95 includes Docker container ownership plus synchronous fail-closed audit writes contending on the Postgres pool.
 
 These numbers are published in the README with the exact commit and date they were measured at, so a stale claim is visible as stale rather than quietly wrong.
 
-**Reproduce:** `docker compose up -d postgres redis && .venv/bin/python -m tests.benchmarks.run` (wipes the local dev audit chain, like the integration tests; per-run reports land in gitignored `tests/benchmarks/reports/`).
+**Reproduce:** `docker build -t portunusmcp:dev .`, start Postgres/Redis, then run `UPSTREAM_RUNTIME_NAMESPACE=portunusmcp-benchmark .venv/bin/python -m tests.benchmarks.run` (wipes local dev state; reports land in gitignored `tests/benchmarks/reports/`).
 
 - **CI integration:** the benchmark suite runs on every merge to `main` (not every PR, to keep CI fast) and the report is uploaded as a build artifact so latency regressions are visible over time, even without a full dashboard.
 
@@ -577,10 +588,10 @@ These numbers are published in the README with the exact commit and date they we
 
 This project runs as a single instance for the portfolio demo, but the design should hold up under discussion about what changes at 10 / 100 / 1,000 / 10,000 concurrent sessions:
 
-- **The gateway itself is stateless** — no in-process session state that isn't already externalized to Redis/Postgres — so horizontal scaling is just running more replicas behind a load balancer (see the deployment diagram below). This is the main reason state was pushed out to Redis/Postgres from day one rather than kept in-memory.
+- **The current gateway is single-replica.** Session state and Docker container handles are in memory, and the audit chain has one safe writer. Redis/Postgres hold durable shared state, but that alone does not make horizontal scaling turnkey.
 - **Postgres write amplification is the first real bottleneck**, though it's addressed for v1 rather than deferred entirely: the naive approach (`SELECT MAX(seq)` before every insert to compute the next hash) is fixed by caching `latest_audit_hash` in Redis so the read is removed from the hot path, while the Postgres write itself remains synchronous to preserve the fail-closed audit guarantee (see §4.8, Audit Log). At scale well beyond a portfolio demo, this still eventually needs either a single-writer audit service that other gateway replicas call into, or periodic chain-checkpointing instead of chaining every single row — but the Redis-cache fix is sufficient for the load levels this project is actually built and benchmarked against. The multi-replica hazard is no longer just suspected: a two-writer variant of item 23's `test_concurrent_audit_writes_do_not_collide` demonstrated the chain forking experimentally — the Postgres insert commits before the Redis pointer CAS, so a `WatchError` retry orphans the already-committed row (148 rows for 100 writes) — which is why the single-writer audit service (or chain checkpointing) is a prerequisite for scaling gateway replicas that write audit rows, not an optional optimization.
 - **Redis is the second consideration** — replay-nonce sets and rate-limit counters are high-churn but low-value-per-key, which is exactly what Redis is good at; at very high scale this becomes a cluster-mode Redis deployment rather than a single instance, which is a config change, not an architecture change.
-- **Async worker pool sizing / connection pooling** — the gateway's upstream connections to MCP servers (especially stdio subprocesses) don't multiplex the way HTTP connections do; each session effectively owns a subprocess. At high concurrency this becomes the actual ceiling, not CPU — worth stating plainly rather than implying the system scales linearly forever.
+- **Container launch and connection ownership** — each local session owns a Docker container and stdio attachment. Launch latency and aggregate container memory become explicit ceilings at high concurrency; these are measured at 10/50/100 sessions in §9.
 
 None of this is built or load-tested at those scales for v1 — it's written here so a technical reviewer sees the bottlenecks were considered, not undiscovered.
 
@@ -632,5 +643,3 @@ jobs:
 - **Distributed gateway note (documented, not built):** a production deployment of this pattern would run multiple stateless gateway replicas behind a load balancer, all reading from a shared Postgres policy/audit store and a shared Redis for replay-nonce and rate-limit state — the gateway holds no local state that isn't already externalized, so horizontal scaling is architecturally straightforward even though this repo only runs a single instance. This is covered as a diagram in `ARCHITECTURE.md`, not implemented, since a solo portfolio project gains little from actually standing up multi-node coordination.
 
 ---
-
-

@@ -22,14 +22,20 @@ from sqlalchemy import func, select
 from services.gateway import risk_engine
 from services.gateway.config import settings
 from services.gateway.db import AuditLog, PolicyVersion, async_session
-from tests.integration.conftest import ECHO_SERVER, Gateway, _key_hash, running_gateway
+from tests.integration.conftest import (
+    ECHO_SERVER,
+    Gateway,
+    _key_hash,
+    running_gateway,
+    server_spec,
+)
 from tests.integration.test_policy_scoping import connect
 
 
 def _policy(keys: dict[str, str], version: int, agent_tools: list[str]) -> dict:
     return {
         "version": version,
-        "servers": {"default": f"{sys.executable} {ECHO_SERVER}"},
+        "servers": {"default": server_spec(f"{sys.executable} {ECHO_SERVER}")},
         "identities": [
             {
                 "id": "agent",

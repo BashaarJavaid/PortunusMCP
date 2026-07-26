@@ -53,7 +53,8 @@ graph TD
         Simulator["Policy Simulator (admin API)"]
     end
 
-    UpClient --> Srv["Upstream MCP Server (stdio subprocess, one per session)"]
+    UpClient --> Docker["Local Docker daemon"]
+    Docker --> Srv["Hardened upstream container (one per session)"]
 
     Replay --> Redis[("Redis: nonces, schema cache, risk counters, session TTL")]
     Risk --> Redis
@@ -71,7 +72,23 @@ graph TD
     Verifier["audit_verifier sidecar (separate process, read-only chain walk)"] --> PG
 ```
 
-**Multiple upstreams are registered in the policy's `servers:` block** (item 35): `server_id → stdio command`, versioned and rolled back with the rest of the policy. Clients connect to `/mcp/<server_id>`; one session is bound to one upstream, chosen at connect time. RBAC grants, drift baselines, schema caches, risk counters, and approvals are all keyed on the real `server_id`, so an identically-named tool on two servers is two different tools.
+**Multiple upstreams are registered in the policy's `servers:` block** as typed container specifications, versioned and rolled back with the rest of the policy. Clients connect to `/mcp/<server_id>`; one session owns one hardened upstream container. RBAC grants, drift baselines, schema caches, risk counters, approvals, and runtime fingerprints are keyed on the real `server_id`.
+
+```yaml
+servers:
+  github:
+    image: "ghcr.io/acme/github-mcp@sha256:..."
+    command: ["python", "-m", "github_mcp"]
+    env:
+      GITHUB_TOKEN: PORTUNUSMCP_UPSTREAM_GITHUB_TOKEN
+    volumes:
+      - source: "portunusmcp-upstream-dev-github-config"
+        target: "/config"
+    network: none
+    resources: {memory_mb: 256, cpus: 0.5, pids: 64}
+```
+
+The local Docker daemon, every referenced image, and every named volume are preflighted before policy activation; images are never pulled at runtime. Containers run as UID 65532 with a read-only root, a restricted `/tmp`, no new privileges, no capabilities, and bounded memory/CPU/PIDs. Environment values can only come from host variables prefixed `PORTUNUSMCP_UPSTREAM_`; gateway database, signing, TOTP, and audit-key secrets are not inherited. Network defaults to `none`. See [ADR-007](./docs/adr/ADR-007-upstream-container-isolation.md).
 
 ---
 
@@ -87,6 +104,7 @@ The full version, including the assumptions the whole model rests on, is in [`TH
 | Audit-log tampering | Yes | Hash chain + per-row ECDSA signature; independently verified by a sidecar holding only the public key |
 | Replay of a captured request | **Yes for `signed` / Partial for `bearer`** | A `signed` request carries no credential: a byte-identical replay is deduped (`DENY_REPLAY`) and a fresh nonce cannot be re-signed (401 at the edge). `bearer` keeps opportunistic dedup only — the API key travels in the captured request |
 | Tool Poisoning (adversarial text in descriptions) | **Partial** | A description changed after approval blocks until re-approval (default High, item 36a); first-contact baselines are heuristically scanned — a hit is audited (`BASELINE_FLAGGED`) and raises every later call's risk, but flags never block and novel phrasing evades pattern lists. Descriptions still reach the LLM verbatim — Partial is the ceiling |
+| Compromised registered upstream reading gateway secrets | **Yes (scoped)** | Per-session hardened containers receive a minimal allowlisted environment and no gateway secrets directory, Docker socket, or DB/Redis credentials; host/gateway compromise remains out of scope |
 | Prompt injection via tool *results* | Partial | A protocol-layer gateway can log and rate-limit but not semantically evaluate result content — client/agent-framework responsibility |
 | Stolen API key | Partial | Behavioral risk factors reduce blast radius; a key alone can't be distinguished from its holder. A `signed` identity's secret never appears on the wire at all — stealing it means compromising a host environment |
 | Compromised gateway host | No | The attacker has the signing key — an infra hardening problem, not an application one |
@@ -102,7 +120,11 @@ python scripts/run_demo.py               # resets demo state, mints keys, writes
 ```
 
 ```bash
-# in another terminal (the rogue upstream command lives in the demo policy's servers: block):
+# First set UPSTREAM_RUNTIME_NAMESPACE in .env and set DOCKER_GID to:
+# docker run --rm -v /var/run/docker.sock:/var/run/docker.sock docker:29.6.1-cli \
+#   stat -c '%g' /var/run/docker.sock
+#
+# In another terminal (the rogue upstream container lives in the policy's servers: block):
 POLICY_FILE=policies/demo-policy.yaml \
   docker compose up -d --build
 
@@ -113,30 +135,32 @@ curl -X POST localhost:9800/_admin/apply_mutation
 docker kill -s HUP portunusmcp-gateway-1
 ```
 
-The driver connects as `developer` — a stock MCP client, no custom `_meta` anywhere (sees only `send_email` / `read_inbox`; the destructive `delete_mailbox` is *absent*, not marked), then as `ops-admin` (sees all three). It makes a successful call, waits for the operator's mutation curl, then shows the drift classified Critical and blocked (`DENY_DRIFT`), the admin re-approval, the same call succeeding against the new schema, then the `signed` ci-agent's captured request replayed byte-identically (`DENY_REPLAY`) and with a forged fresh nonce (HTTP 401 — the capture holds no credential to re-sign with), and finally a Policy Simulation replaying the demo's own traffic against the v2 draft (`would_now_deny: 3`) before printing the hash-chained audit receipts.
+The driver connects as `developer` — a stock MCP client, no custom `_meta` on the first call (sees only `send_email` / `read_inbox`; the destructive `delete_mailbox` is *absent*, not marked), then as `ops-admin` (sees all three). It makes a successful call, waits for the operator's mutation curl, then shows the drift classified Critical and blocked (`DENY_DRIFT`), the admin re-approval, and the same call succeeding after a TOTP step-up if current risk requires it. It then shows the `signed` ci-agent's captured request replayed byte-identically (`DENY_REPLAY`) and with a forged fresh nonce (HTTP 401), followed by Policy Simulation of the v2 draft (`would_now_deny: 2`) and the hash-chained audit receipts.
 
 All seven beats are live — nothing is scripted or faked. The mutation fires only when the operator actually calls that endpoint, so the adversarial event is visible on camera rather than happening off-screen on a timer.
 
 Afterwards, a plain `docker compose up` deliberately refuses to start: the demo's policy v1 is on record with different content, and the fail-closed activation check catches it. The startup error names the fix — `docker compose run --rm gateway python scripts/reset_dev_state.py --yes` (dev-only: wipes the local audit chain and demo state, never the check).
 
-**Development setup:** `python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"`, then `.venv/bin/pytest`. Full command list in [`CLAUDE.md`](./CLAUDE.md).
+**Development setup:** `python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"`, copy `.env.example` to `.env`, set its required Docker namespace/GID values, build the local upstream image with `docker build -t portunusmcp:dev .`, then run `.venv/bin/pytest`. The mounted Docker socket is root-equivalent access to the host; only trusted operators should receive a shell in the gateway container. Full command list in [`CLAUDE.md`](./CLAUDE.md).
 
 ---
 
 ## Performance
 
-Measured, not estimated, on **2026-07-10** at commit **`902341f`** with the full §4.2 pipeline active (replay → auth → RBAC + ABAC → drift → risk scoring with all eight factors → param validation → signed audit write). Methodology, hardware, and reproduction steps: [`ARCHITECTURE.md` §9](./ARCHITECTURE.md#9-performance-benchmarks).
+Measured, not estimated, on **2026-07-26** from the item-39 working tree based on **`b180258`**, with real per-session Docker upstreams and the full §4.2 pipeline active. Methodology, hardware, and reproduction steps: [`ARCHITECTURE.md` §9](./ARCHITECTURE.md#9-performance-benchmarks).
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 1.38 / 1.33 / 1.56 / 1.94 ms | 13.47 / 12.95 / 16.12 / 24.46 ms | 12.09 / 11.62 / 14.56 / 22.51 ms |
-| Single call, cold schema cache | 1.38 / 1.33 / 1.56 / 1.94 ms | 16.62 / 16.17 / 19.51 / 24.71 ms | — |
-| 10 concurrent sessions (p95) | — | 160.20 ms | — |
-| 50 concurrent sessions (p95) | — | 565.46 ms | — |
-| 100 concurrent sessions (p95) | — | 1228.23 ms | — |
-| `tools/list` payload (pruned identity) | 1506 B (unpruned) | 797 B | **47.1% reduction** |
+| Single call, cached schema | 0.34 / 0.23 / 0.66 / 1.32 ms | 12.87 / 12.25 / 15.49 / 23.45 ms | 12.53 / 12.02 / 14.83 / 22.13 ms |
+| Single call, cold schema cache | 0.34 / 0.23 / 0.66 / 1.32 ms | 15.34 / 14.39 / 18.46 / 39.97 ms | — |
+| 10 concurrent sessions (p95) | — | 163.04 ms | — |
+| 50 concurrent sessions (p95) | — | 1201.06 ms | — |
+| 100 concurrent sessions (p95) | — | 2974.65 ms | — |
+| `tools/list` payload (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
 
-Latencies are mean / p50 / p95 / p99. The high-concurrency p95 is dominated by the synchronous fail-closed audit write contending on the Postgres pool, and by one stdio subprocess per session — both are known ceilings, discussed in `ARCHITECTURE.md` §10.
+Latencies are mean / p50 / p95 / p99. The high-concurrency p95 includes one hardened Docker container per session as well as the synchronous fail-closed audit write; both are known ceilings, discussed in `ARCHITECTURE.md` §10.
+
+Container initialization: first 512.46 ms; next 20 p50 456.59 ms / p95 626.01 ms. Peak RSS after the 100-session run was 204 MiB (gateway + harness); initialized upstream containers used 1,095 MiB in aggregate.
 
 ---
 
@@ -164,9 +188,7 @@ Latencies are mean / p50 / p95 / p99. The high-concurrency p95 is dominated by t
 
 ## Roadmap
 
-Phases 1–3 (core gateway → hardening → risk & policy features) are complete; Phase 4 is production infra and finalization.
-
-**Phase 5 is the work that takes this from a working demo to something an AppSec team could actually adopt**, and it came out of an adversarial self-review of the finished v1: three defect fixes (sanitizer bypass, duplicated risk thresholds, uncapped risk decay), then a per-identity auth posture that both restores stock-client compatibility and makes replay protection real by moving the secret off the wire, a genuine multi-server registry, tool-description integrity, and true step-up auth.
+Phases 1–5 are complete. **Phase 6 is making the adopted gateway honestly self-hostable.** Item 39 now gives every local upstream a real per-session container boundary; item 40 (resource limits, deadlines, and readiness) is next.
 
 Each item in [`ROADMAP.md`](./ROADMAP.md) states the check that proves it done and the threat-model row it upgrades — **an item is finished when that row can be honestly rewritten, not when the code merges.**
 

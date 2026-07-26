@@ -24,6 +24,7 @@ from services.gateway import (
     policy_simulator,
     policy_versions,
     signing,
+    upstream_client,
 )
 from services.gateway.approvals import ApprovalStore
 from services.gateway.audit_log import AuditWriter
@@ -44,12 +45,18 @@ logger = structlog.get_logger(__name__)
 KEY_HEADER = "x-portunusmcp-key"
 
 
-async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
+async def _reload_policy(
+    store: PolicyStore,
+    writer: AuditWriter,
+    manager: SessionManager,
+    runtime: upstream_client.DockerRuntime,
+) -> None:
     old_version = store.engine.version
     candidate = store.load_candidate()
     if candidate is None:
         return  # last-known-good stays active; failure already logged
     try:
+        await runtime.preflight(candidate.policy.servers)
         # Record before swap (item 19): a rejected or unrecordable activation keeps
         # last-known-good (§5 fail-closed).
         await policy_versions.record_activation(candidate, "operator", async_session)
@@ -57,6 +64,7 @@ async def _reload_policy(store: PolicyStore, writer: AuditWriter) -> None:
         logger.exception("policy_activation_rejected_keeping_last_known_good")
         return
     store.swap(candidate)
+    await manager.evict_outdated()
     try:
         await writer.write(
             EventType.POLICY_ACTIVATED,
@@ -96,6 +104,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     store = PolicyStore(settings.policy_file)
     app.state.policy_store = store
     signing_key = signing.load_private_key(settings.signing_key_file)
+    runtime = await upstream_client.DockerRuntime.create(store.engine.policy.servers)
+    app.state.upstream_runtime = runtime
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
     app.state.redis = redis_client  # auth-failure counter (§4.8, item 18)
     writer = AuditWriter(redis_client, async_session, store, signing_key)
@@ -133,6 +143,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         risk_engine,
         approval_store,
         ChallengeStore(redis_client),
+        runtime,
     )
     app.state.session_manager = manager
     # §7 metrics on a separate internal-only listener — never the published app
@@ -142,7 +153,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     sweep = asyncio.create_task(manager.sweep_loop())
     # Policy hot-reload on SIGHUP (§8): docker kill -s HUP <gateway>.
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGHUP, lambda: loop.create_task(_reload_policy(store, writer)))
+    loop.add_signal_handler(
+        signal.SIGHUP,
+        lambda: loop.create_task(_reload_policy(store, writer, manager, runtime)),
+    )
     try:
         yield
     finally:
@@ -248,6 +262,11 @@ async def rollback_policy(version: int, request: Request) -> dict[str, object]:
         engine = policy_engine.load_bytes(snapshot.read_bytes())
     except Exception as exc:
         raise HTTPException(status_code=409, detail=f"revision v{version} is invalid") from exc
+    runtime: upstream_client.DockerRuntime = request.app.state.upstream_runtime
+    try:
+        await runtime.preflight(engine.policy.servers)
+    except upstream_client.RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     try:
         await policy_versions.record_rollback(engine, identity_id, async_session)
     except LookupError as exc:
@@ -267,6 +286,8 @@ async def rollback_policy(version: int, request: Request) -> dict[str, object]:
         },
     )
     store.swap(engine)
+    manager: SessionManager = request.app.state.session_manager
+    await manager.evict_outdated()
     logger.warning(
         "policy_rolled_back_in_memory_only",
         old_version=old_version,
@@ -466,7 +487,7 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
         return
 
     # After auth, so an unauthenticated probe can't enumerate registered server ids.
-    if engine.server_command(server_id) is None:
+    if engine.server_config(server_id) is None:
         await Response("unknown server", status_code=404)(scope, receive, send)
         return
 

@@ -1,9 +1,8 @@
 """Per-client session lifecycle (ARCHITECTURE.md §4.8).
 
-One session = one client connection + one upstream stdio subprocess + one message pump.
-The registry of live subprocess handles exists so the lifespan/SIGTERM handler can walk
-it on shutdown; idle sessions (network drop, crashed client) are reaped via a Redis TTL
-key rather than a per-request check.
+One session = one client connection + one isolated upstream container + one message
+pump. The registry of live handles exists so lifespan/SIGTERM cleanup can stop every
+container; idle sessions are reaped via a Redis TTL key.
 """
 
 import asyncio
@@ -44,8 +43,9 @@ def _last_seen_key(session_id: str) -> str:
 class Session:
     id: str
     transport: StreamableHTTPServerTransport
-    process: asyncio.subprocess.Process
+    process: upstream_client.ContainerProcess
     interceptor: Interceptor
+    runtime_fingerprint: str
     task: asyncio.Task[None] | None = None
     ready: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -62,6 +62,7 @@ class SessionManager:
         risk_engine: RiskEngine,
         approval_store: ApprovalStore,
         challenge_store: ChallengeStore,
+        runtime: upstream_client.DockerRuntime,
     ) -> None:
         self._redis = redis_client
         self._policy_store = policy_store
@@ -72,6 +73,7 @@ class SessionManager:
         self._risk_engine = risk_engine
         self._approval_store = approval_store
         self._challenge_store = challenge_store
+        self._runtime = runtime
         self._sessions: dict[str, Session] = {}
 
     def get(self, session_id: str) -> Session | None:
@@ -80,8 +82,8 @@ class SessionManager:
     async def create(self, identity_id: str, server_id: str) -> Session:
         # Resolved against the live registry (item 35) — an id that vanished in a
         # policy swap fails here, before anything is recorded or spawned.
-        command = self._policy_store.engine.server_command(server_id)
-        if command is None:
+        server = self._policy_store.engine.server_config(server_id)
+        if server is None:
             raise LookupError(f"unknown server {server_id!r}")
         session_id = uuid.uuid4().hex
         # No record, no session (§5): the SESSION_START row lands before anything spawns.
@@ -92,7 +94,7 @@ class SessionManager:
             payload_extra={"session_id": session_id},
         )
         transport = StreamableHTTPServerTransport(mcp_session_id=session_id)
-        process = await upstream_client.spawn(command)
+        process = await self._runtime.spawn(server, session_id, server_id)
 
         async def send_upstream(message: JSONRPCMessage) -> None:
             await upstream_client.write_message(process, message)
@@ -101,6 +103,7 @@ class SessionManager:
             id=session_id,
             transport=transport,
             process=process,
+            runtime_fingerprint=server.runtime_fingerprint,
             interceptor=Interceptor(
                 identity_id=identity_id,
                 server_id=server_id,
@@ -138,6 +141,7 @@ class SessionManager:
                 done, pending = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
                     task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
                 for task in done:
                     if not task.cancelled() and task.exception() is not None:
                         logger.warning(
@@ -199,49 +203,41 @@ class SessionManager:
         if session.task is not None and session.task is not asyncio.current_task():
             session.task.cancel()
         try:
-            if session.process.returncode is None:
-                session.process.terminate()
-                try:
-                    await asyncio.wait_for(
-                        session.process.wait(), timeout=settings.shutdown_grace_seconds
-                    )
-                except TimeoutError:
-                    session.process.kill()
-        except (ProcessLookupError, OSError):
+            await self._runtime.stop(session.process, settings.shutdown_grace_seconds)
+        except (ProcessLookupError, OSError, upstream_client.RuntimeError):
             logger.warning(
-                "session_subprocess_already_gone", session_id=session_id, during="teardown"
+                "session_container_cleanup_failed", session_id=session_id, during="teardown"
             )
         await self._redis.delete(_last_seen_key(session_id))
 
+    async def evict_outdated(self) -> None:
+        """Disconnect sessions whose container launch specification is no longer active."""
+        outdated = []
+        for session in list(self._sessions.values()):
+            server = self._policy_store.engine.server_config(session.interceptor.server_id)
+            if server is None or server.runtime_fingerprint != session.runtime_fingerprint:
+                outdated.append(session.id)
+        await asyncio.gather(*(self.teardown(session_id) for session_id in outdated))
+
     async def shutdown_all(self) -> None:
-        """Lifespan/SIGTERM handler (ARCHITECTURE.md §4.8): terminate every registered
-        subprocess, wait one grace period, kill survivors. Each subprocess op is guarded
-        per-process — an already-dead process must not abort cleanup of the rest."""
+        """Lifespan/SIGTERM handler: stop every registered upstream container."""
         sessions = list(self._sessions.values())
         self._sessions.clear()
         for session in sessions:
             if session.task is not None:
                 session.task.cancel()
-            try:
-                if session.process.returncode is None:
-                    session.process.terminate()
-            except (ProcessLookupError, OSError):
+        results = await asyncio.gather(
+            *(
+                self._runtime.stop(session.process, settings.shutdown_grace_seconds)
+                for session in sessions
+            ),
+            return_exceptions=True,
+        )
+        for session, result in zip(sessions, results, strict=True):
+            if isinstance(result, BaseException):
                 logger.warning(
-                    "session_subprocess_already_gone", session_id=session.id, during="shutdown"
+                    "session_container_cleanup_failed",
+                    session_id=session.id,
+                    during="shutdown",
+                    error=repr(result),
                 )
-        alive = [s for s in sessions if s.process.returncode is None]
-        if alive:
-            await asyncio.wait(
-                [asyncio.ensure_future(s.process.wait()) for s in alive],
-                timeout=settings.shutdown_grace_seconds,
-            )
-        for session in alive:
-            if session.process.returncode is None:
-                try:
-                    session.process.kill()
-                except (ProcessLookupError, OSError):
-                    logger.warning(
-                        "session_subprocess_already_gone",
-                        session_id=session.id,
-                        during="shutdown",
-                    )

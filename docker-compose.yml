@@ -27,19 +27,26 @@ services:
 
   gateway:
     build: .
+    image: portunusmcp:dev
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://portunusmcp:portunusmcp@postgres:5432/portunusmcp}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      # Upstream stdio commands live in the policy's `servers:` block (item 35),
-      # spawned per session inside this container.
+      # Upstream container specs live in the policy's `servers:` block (item 39).
       POLICY_FILE: ${POLICY_FILE:-policies/example-policy.yaml}
       # Signed-identity secret for the demo policy's ci-agent (item 34): the YAML
       # names this var; the value never enters the policy file or the repo.
       PORTUNUSMCP_DEMO_SIGNING_SECRET: ${PORTUNUSMCP_DEMO_SIGNING_SECRET:-}
+      PORTUNUSMCP_DEMO_TOTP_SECRET: ${PORTUNUSMCP_DEMO_TOTP_SECRET:-}
+      BUSINESS_HOURS_START_UTC: ${BUSINESS_HOURS_START_UTC:-9}
+      BUSINESS_HOURS_END_UTC: ${BUSINESS_HOURS_END_UTC:-18}
       # Metrics default to loopback (config.py) so a bare-host run doesn't expose
       # identity ids / tool names. Here the port is unpublished, so the compose
       # network is the boundary and Prometheus needs to reach it.
       METRICS_HOST: "0.0.0.0"
+      UPSTREAM_RUNTIME_NAMESPACE: ${UPSTREAM_RUNTIME_NAMESPACE:?set UPSTREAM_RUNTIME_NAMESPACE}
+      DOCKER_HOST: unix:///var/run/docker.sock
+    group_add:
+      - ${DOCKER_GID:?set DOCKER_GID to the docker.sock group id}
     volumes:
       # Host-editable policies: edit + `docker kill -s HUP portunusmcp-gateway-1` to reload.
       # Read-only so a compromised gateway can't persist a policy backdoor; only the
@@ -48,9 +55,8 @@ services:
       - ./policies/revisions:/app/policies/revisions
       # Audit signing keypair: mint once via `python scripts/generate_signing_key.py`.
       - ./secrets:/app/secrets:ro
-      # Rogue-demo mutation state, shared with the rogue admin service (item 14). A bind
-      # mount so run_demo.py can reset/watch it from the host; gitignored.
-      - ./.rogue-state:/rogue-state
+      # Trusted gateway-only Docker control plane. Per-session upstreams never receive it.
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8000:8000"
     depends_on:
@@ -62,6 +68,7 @@ services:
   # Detective control (§5): its downtime never blocks gateway traffic.
   verifier:
     build: .
+    image: portunusmcp:dev
     command: python scripts/audit_verifier_daemon.py
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://portunusmcp:portunusmcp@postgres:5432/portunusmcp}
@@ -69,22 +76,23 @@ services:
       METRICS_PORT: "9101"
       METRICS_HOST: "0.0.0.0"
     volumes:
-      # Only the public key is read; the private key never leaves the gateway process.
-      - ./secrets:/app/secrets:ro
+      # Only the public key is read; the private key never enters this container.
+      - ./secrets/audit_signing_key.pub.pem:/app/secrets/audit_signing_key.pub.pem:ro
     depends_on:
       postgres:
         condition: service_healthy
 
   # Rogue-demo admin endpoint (item 14): mutation is a real, operator-triggered call —
   # curl -X POST localhost:9800/_admin/apply_mutation — never a timer. The rogue MCP
-  # server itself runs as per-session stdio subprocesses inside the gateway container
-  # (the demo policy's `servers:` block registers it, see scripts/run_demo.py);
-  # this service only hosts the mutation endpoint, sharing state via the bind mount.
+  # server itself runs in per-session isolated containers (the demo policy registers
+  # it); this service only hosts the mutation endpoint, sharing a named volume.
   rogue:
     build: .
+    image: portunusmcp:dev
+    user: "0:0"
     command: python sample_target/rogue_server.py --admin --port 9800 --state /rogue-state/state.json
     volumes:
-      - ./.rogue-state:/rogue-state
+      - rogue_state:/rogue-state
     ports:
       - "9800:9800"
 
@@ -117,3 +125,5 @@ services:
 
 volumes:
   pgdata:
+  rogue_state:
+    name: portunusmcp-upstream-${UPSTREAM_RUNTIME_NAMESPACE:?set UPSTREAM_RUNTIME_NAMESPACE}-rogue-state

@@ -18,8 +18,14 @@ from services.gateway.db import Approval, async_session
 from services.gateway.main import _record_startup_activation
 from services.gateway.policy_engine import load_bytes
 
-DEMO_POLICY = b"version: 1\nservers:\n  default: demo-command\n"
-DEFAULT_POLICY = b"version: 1\nservers:\n  default: example-command\n"
+DEMO_POLICY = (
+    b"version: 1\nservers:\n  default:\n"
+    b"    image: example/demo:test\n    command: [demo-command]\n"
+)
+DEFAULT_POLICY = (
+    b"version: 1\nservers:\n  default:\n"
+    b"    image: example/default:test\n    command: [example-command]\n"
+)
 
 
 @pytest.fixture

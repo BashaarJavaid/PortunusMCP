@@ -1,3 +1,5 @@
+FROM docker:29.6.1-cli AS docker_cli
+
 FROM python:3.12-slim AS builder
 
 WORKDIR /build
@@ -10,6 +12,7 @@ FROM python:3.12-slim
 RUN useradd --create-home --uid 1000 gateway
 
 WORKDIR /app
+COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY services ./services

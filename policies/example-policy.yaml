@@ -3,10 +3,12 @@
 #   python scripts/generate_api_key.py
 # (or run `python scripts/run_demo.py`, which writes policies/demo-policy.yaml with real keys)
 version: 1
-# Server registry (Phase 5, item 35): server_id -> stdio spawn command. Clients
-# connect to /mcp/<server_id>; a grant naming an unregistered server fails load.
+# Server registry (items 35 + 39): server_id -> isolated container specification.
+# Images must already exist locally; clients connect to /mcp/<server_id>.
 servers:
-  default: "python sample_target/overscoped_server.py"
+  default:
+    image: "portunusmcp:dev"
+    command: ["python", "sample_target/overscoped_server.py"]
 # Risk Engine v1 inputs (Phase 3, item 16). Tiers: low/medium/high/critical; unlisted
 # tools contribute 0. protected_repos are fnmatch patterns matched against every
 # string argument value. Placeholders for the overscoped_server demo cast.

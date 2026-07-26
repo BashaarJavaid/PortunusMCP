@@ -5,6 +5,7 @@ schema_hash) ETag on tools/list responses."""
 import asyncio
 import os
 import signal
+from unittest.mock import AsyncMock
 
 import pytest
 import redis.asyncio as aioredis
@@ -13,8 +14,10 @@ from mcp import McpError
 from mcp.types import TextContent
 from sqlalchemy import select
 
+from services.gateway import upstream_client
 from services.gateway.config import settings
 from services.gateway.db import AuditLog, async_session
+from services.gateway.main import app
 from tests.integration.conftest import Gateway, policy_dict
 from tests.integration.test_policy_scoping import connect
 
@@ -67,6 +70,22 @@ async def test_broken_reload_keeps_last_known_good(gateway: Gateway) -> None:
         assert [tool.name for tool in tools.tools] == ["echo", "add"]
 
     # Only the boot-time activation (item 19) — the broken reload never activated.
+    assert [event for event, _ in await fetch_events()].count("POLICY_ACTIVATED") == 1
+
+
+async def test_runtime_preflight_failure_keeps_last_known_good(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        app.state.upstream_runtime,
+        "preflight",
+        AsyncMock(side_effect=upstream_client.RuntimeError("image missing")),
+    )
+    gateway.policy_path.write_text(yaml.safe_dump(policy_dict(gateway.keys, version=2)))
+    os.kill(os.getpid(), signal.SIGHUP)
+    await asyncio.sleep(0.3)
+
+    assert app.state.policy_store.engine.version == 1
     assert [event for event, _ in await fetch_events()].count("POLICY_ACTIVATED") == 1
 
 

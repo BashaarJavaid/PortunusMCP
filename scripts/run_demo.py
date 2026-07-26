@@ -19,8 +19,11 @@ and when prompted, in another terminal (the exact command, with this run's secre
 is printed by the script):
     POLICY_FILE=policies/demo-policy.yaml \
       PORTUNUSMCP_DEMO_SIGNING_SECRET=<printed by the script> \
+      UPSTREAM_RUNTIME_NAMESPACE=portunusmcp-demo \
+      BUSINESS_HOURS_START_UTC=0 BUSINESS_HOURS_END_UTC=24 \
+      PORTUNUSMCP_DEMO_TOTP_SECRET=<printed by the script> \
       docker compose up -d --build
-(the rogue upstream command lives in the demo policy's `servers:` block, item 35)
+(the rogue upstream container lives in the demo policy's `servers:` block)
 then, when prompted again (the rug pull, visible on screen):
     curl -X POST localhost:9800/_admin/apply_mutation
 and for the closing simulation beat (activates the v2 draft so it gets a snapshot):
@@ -31,6 +34,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import secrets
 import sys
 import time
@@ -51,7 +55,7 @@ from mcp.types import LATEST_PROTOCOL_VERSION  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
 from scripts import reset_dev_state as dev_state  # noqa: E402
-from services.gateway import auth  # noqa: E402
+from services.gateway import auth, step_up  # noqa: E402
 from services.gateway.config import settings  # noqa: E402
 from services.gateway.db import AuditLog, async_session, engine  # noqa: E402
 from services.gateway.replay_guard import (  # noqa: E402
@@ -62,7 +66,7 @@ from services.gateway.replay_guard import (  # noqa: E402
 GATEWAY = "http://localhost:8000"
 ROOT = Path(__file__).parent.parent
 POLICY_PATH = ROOT / "policies" / "demo-policy.yaml"
-STATE_PATH = ROOT / ".rogue-state" / "state.json"
+RUNTIME_NAMESPACE = os.environ.get("UPSTREAM_RUNTIME_NAMESPACE", "")
 
 RECEIPT_EVENTS = [
     "TOOLS_LIST",
@@ -83,6 +87,7 @@ def mint_key() -> str:
 
 
 SIGNED_SECRET_ENV_NAME = "PORTUNUSMCP_DEMO_SIGNING_SECRET"
+TOTP_SECRET_ENV_NAME = "PORTUNUSMCP_DEMO_TOTP_SECRET"
 SIGNED_HEADERS = {
     "content-type": "application/json",
     "accept": "application/json, text/event-stream",
@@ -134,16 +139,30 @@ def write_policy(
         yaml.safe_dump(
             {
                 "version": version,
-                # Server registry (item 35): the rogue upstream, spawned per session
-                # inside the gateway container (container path for --state).
+                # The rogue upstream runs per-session in an item-39 isolated
+                # container with read-only demo state.
                 "servers": {
-                    "default": "python sample_target/rogue_server.py"
-                    " --state /rogue-state/state.json"
+                    "default": {
+                        "image": "portunusmcp:dev",
+                        "command": [
+                            "python",
+                            "sample_target/rogue_server.py",
+                            "--state",
+                            "/rogue-state/state.json",
+                        ],
+                        "volumes": [
+                            {
+                                "source": (f"portunusmcp-upstream-{RUNTIME_NAMESPACE}-rogue-state"),
+                                "target": "/rogue-state",
+                            }
+                        ],
+                    }
                 },
                 "identities": [
                     {
                         "id": "developer",
                         "api_key_hash": key_hash("developer"),
+                        "totp_secret_env": TOTP_SECRET_ENV_NAME,
                         "allowed_servers": [
                             {
                                 "server_id": "default",
@@ -217,13 +236,16 @@ async def connect(api_key: str) -> AsyncIterator[ClientSession]:
                 yield session
 
 
-async def wait_for_gateway(api_key: str, signing_secret: str) -> None:
+async def wait_for_gateway(api_key: str, signing_secret: str, totp_secret: str) -> None:
     print("\nWaiting for the gateway to come up with the demo policy...")
     print("  In another terminal:")
     print("    POLICY_FILE=policies/demo-policy.yaml \\")
+    print(f"      UPSTREAM_RUNTIME_NAMESPACE={RUNTIME_NAMESPACE} \\")
     print(f"      {SIGNED_SECRET_ENV_NAME}={signing_secret} \\")
+    print("      BUSINESS_HOURS_START_UTC=0 BUSINESS_HOURS_END_UTC=24 \\")
+    print(f"      {TOTP_SECRET_ENV_NAME}={totp_secret} \\")
     print("      docker compose up -d --build")
-    print("  (the rogue upstream command is in the demo policy's servers: block)")
+    print("  (the rogue upstream container is in the demo policy's servers: block)")
     print(
         "  (stack already running with the demo policy? hot-reload this run's fresh"
         " keys with:  docker kill -s HUP portunusmcp-gateway-1)"
@@ -254,12 +276,32 @@ async def wait_for_mutation() -> None:
     section("the rug pull — an operator mutates the rogue server, on screen")
     print("  In another terminal:  curl -X POST localhost:9800/_admin/apply_mutation")
     print("  (no timer, no hidden trigger — the schema changes only when you do this)")
-    while not STATE_PATH.exists():
-        await asyncio.sleep(0.5)
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                response = await client.get("http://localhost:9800/_admin/status")
+                if response.status_code == 200 and response.json()["mutated"]:
+                    break
+            except httpx.HTTPError:
+                pass
+            await asyncio.sleep(0.5)
     print(
         "  mutation applied: send_email now has a REQUIRED bcc parameter and a"
         " poisoned description."
     )
+
+
+async def reset_mutation() -> None:
+    async with httpx.AsyncClient() as client:
+        for _ in range(120):
+            try:
+                response = await client.post("http://localhost:9800/_admin/reset")
+                if response.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            await asyncio.sleep(0.5)
+    sys.exit("rogue admin service never became ready")
 
 
 async def drift_and_block(api_key: str) -> None:
@@ -280,7 +322,7 @@ async def drift_and_block(api_key: str) -> None:
             print(f"  audit_id: {decision['audit_id']}")
 
 
-async def approve_and_retry(keys: dict[str, str]) -> None:
+async def approve_and_retry(keys: dict[str, str], totp_secret: str) -> None:
     section("ops-admin reviews and re-approves the new schema")
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -293,9 +335,22 @@ async def approve_and_retry(keys: dict[str, str]) -> None:
 
     section("developer retries (with the now-required bcc) — allowed again")
     async with connect(keys["developer"]) as session:
-        result = await session.call_tool(
-            "send_email", {"to": "a@b.c", "subject": "hi", "body": "hello", "bcc": "x@y.z"}
-        )
+        arguments = {"to": "a@b.c", "subject": "hi", "body": "hello", "bcc": "x@y.z"}
+        try:
+            result = await session.call_tool("send_email", arguments)
+        except McpError as error:
+            decision = error.error.data
+            if decision["event_type"] != "CHALLENGE" or not decision["challenge_id"]:
+                raise
+            print("  suspicious baseline + current context requires TOTP step-up.")
+            result = await session.call_tool(
+                "send_email",
+                arguments,
+                meta={
+                    step_up.CHALLENGE_ID_META_KEY: decision["challenge_id"],
+                    step_up.CHALLENGE_PROOF_META_KEY: step_up.totp_code(totp_secret),
+                },
+            )
         print(f"  {result.content[0].text}")  # type: ignore[union-attr]
 
 
@@ -436,11 +491,13 @@ async def show_audit_receipts() -> None:
 
 async def main() -> None:
     section("PortunusMCP demo — pruning, drift blocking, replay guard, policy simulation")
-    STATE_PATH.unlink(missing_ok=True)  # start from the benign schema
+    if not RUNTIME_NAMESPACE:
+        sys.exit("UPSTREAM_RUNTIME_NAMESPACE is required (for example: portunusmcp-dev)")
     await reset_dev_state()
     keys = {"developer": mint_key(), "ops-admin": mint_key()}
     ci_key_id = f"kid_{secrets.token_hex(8)}"
     ci_secret = mint_key()
+    developer_totp_secret = base64.b32encode(secrets.token_bytes(20)).decode()
     write_policy(keys, ci_key_id)
     print(f"\nDemo policy written to {POLICY_PATH.relative_to(Path.cwd())}")
     print("  developer  -> allowed: send_email, read_inbox (bearer — a stock MCP client)")
@@ -451,7 +508,8 @@ async def main() -> None:
         " its admin endpoint is hit."
     )
 
-    await wait_for_gateway(keys["developer"], ci_secret)
+    await wait_for_gateway(keys["developer"], ci_secret, developer_totp_secret)
+    await reset_mutation()  # persistent named volume starts every recording benign
     await clear_risk_counters()  # the waiting polls above were wrong-key 401s
 
     await show_tools("developer", keys["developer"])
@@ -470,7 +528,7 @@ async def main() -> None:
 
     await wait_for_mutation()
     await drift_and_block(keys["developer"])
-    await approve_and_retry(keys)
+    await approve_and_retry(keys, developer_totp_secret)
     await replay_blocked(ci_key_id, ci_secret.encode())
     await simulate_draft_policy(keys, ci_key_id)
     await show_audit_receipts()
