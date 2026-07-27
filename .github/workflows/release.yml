@@ -245,7 +245,7 @@ jobs:
             "moby-engine=$DOCKER_ENGINE_VERSION" \
             "moby-cli=$DOCKER_ENGINE_VERSION"
           sudo systemctl restart docker
-          test "$(docker version --format '{{.Server.Version}}')" = "29.6.2"
+          test "$(docker version --format '{{.Server.Version}}')" = "29.6.2-1"
           sudo mkdir -p /usr/local/lib/docker/cli-plugins
           sudo curl -fsSL \
             "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
@@ -298,7 +298,7 @@ jobs:
             "moby-engine=$DOCKER_ENGINE_VERSION" \
             "moby-cli=$DOCKER_ENGINE_VERSION"
           sudo systemctl restart docker
-          test "$(docker version --format '{{.Server.Version}}')" = "29.6.2"
+          test "$(docker version --format '{{.Server.Version}}')" = "29.6.2-1"
           sudo mkdir -p /usr/local/lib/docker/cli-plugins
           sudo curl -fsSL \
             "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
