@@ -199,6 +199,7 @@ async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -
     tmp_path.chmod(0o755)
     revisions = tmp_path / "revisions"
     revisions.mkdir(mode=0o777)
+    revisions.chmod(0o777)
     private_key, public_key = write_signing_keypair(tmp_path)
     private_key.chmod(0o644)  # test runner UID can differ from the image's UID 1000
 
