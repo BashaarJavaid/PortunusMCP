@@ -20,6 +20,7 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/bashaarjavaid/portunusmcp
+  DOCKER_ENGINE_VERSION: 5:29.6.2-1~ubuntu.24.04~noble
   COMPOSE_VERSION: v5.3.1
   RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
@@ -237,10 +238,13 @@ jobs:
         with:
           name: release-assets
           path: dist
-      - name: Install Docker Compose 5
+      - name: Install supported Docker
         run: |
-          test "$(docker version --format '{{.Server.Version}}')" != ""
-          test "$(docker version --format '{{.Server.Version}}' | cut -d. -f1)" = "29"
+          sudo apt-get update
+          sudo apt-get install --yes \
+            "docker-ce=$DOCKER_ENGINE_VERSION" \
+            "docker-ce-cli=$DOCKER_ENGINE_VERSION"
+          test "$(docker version --format '{{.Server.Version}}')" = "29.6.2"
           sudo mkdir -p /usr/local/lib/docker/cli-plugins
           sudo curl -fsSL \
             "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
@@ -286,9 +290,13 @@ jobs:
         with:
           name: release-assets
           path: dist
-      - name: Install Docker Compose 5
+      - name: Install supported Docker
         run: |
-          test "$(docker version --format '{{.Server.Version}}' | cut -d. -f1)" = "29"
+          sudo apt-get update
+          sudo apt-get install --yes \
+            "docker-ce=$DOCKER_ENGINE_VERSION" \
+            "docker-ce-cli=$DOCKER_ENGINE_VERSION"
+          test "$(docker version --format '{{.Server.Version}}')" = "29.6.2"
           sudo mkdir -p /usr/local/lib/docker/cli-plugins
           sudo curl -fsSL \
             "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
