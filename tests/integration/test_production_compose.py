@@ -81,6 +81,8 @@ def _require_docker() -> None:
 
 def _write_env(
     tmp_path: Path,
+    policy_dir: Path,
+    signing_key_dir: Path,
 ) -> tuple[Path, Path, dict[str, int]]:
     ports = {
         "gateway": _free_port(),
@@ -99,8 +101,8 @@ def _write_env(
         "REDIS_PASSWORD": secrets.token_urlsafe(32),
         "GRAFANA_ADMIN_USER": "compose-admin",
         "GRAFANA_ADMIN_PASSWORD": secrets.token_urlsafe(32),
-        "POLICY_DIR_HOST": str(tmp_path),
-        "AUDIT_SIGNING_KEY_DIR": str(tmp_path),
+        "POLICY_DIR_HOST": str(policy_dir),
+        "AUDIT_SIGNING_KEY_DIR": str(signing_key_dir),
         "UPSTREAM_RUNTIME_NAMESPACE": f"prod-test-{uuid.uuid4().hex[:8]}",
         "DOCKER_GID": _docker_socket_gid(),
         "GATEWAY_PORT": str(ports["gateway"]),
@@ -191,14 +193,16 @@ async def _wait_ready(url: str) -> None:
 
 async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -> None:
     _require_docker()
-    tmp_path.chmod(0o755)
-    (tmp_path / "revisions").mkdir(mode=0o777)
-    (tmp_path / "public").mkdir(mode=0o777)
-    private_key, _ = write_signing_keypair(tmp_path)
-    private_key.chmod(0o644)  # test runner UID can differ from the image's UID 1000
+    policy_dir = tmp_path / "config"
+    signing_key_dir = tmp_path / "secrets"
+    policy_dir.mkdir()
+    signing_key_dir.mkdir()
+    (policy_dir / "revisions").mkdir()
+    (signing_key_dir / "public").mkdir()
+    write_signing_keypair(signing_key_dir)
 
     api_key = secrets.token_urlsafe(32)
-    policy = tmp_path / "policy.yaml"
+    policy = policy_dir / "policy.yaml"
     policy.write_text(
         yaml.safe_dump(
             {
@@ -225,8 +229,7 @@ async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -
             }
         )
     )
-    policy.chmod(0o644)
-    env_file, _, ports = _write_env(tmp_path)
+    env_file, _, ports = _write_env(tmp_path, policy_dir, signing_key_dir)
     project = f"portunusmcp-prod-test-{uuid.uuid4().hex[:8]}"
 
     rendered = _render(env_file, project)
@@ -269,6 +272,21 @@ async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -
                 }
             }
         )
+    )
+    _run(
+        "docker",
+        "run",
+        "--rm",
+        "--user",
+        "0",
+        "-v",
+        f"{policy_dir}:/policy",
+        "-v",
+        f"{signing_key_dir}:/secrets",
+        LOCAL_IMAGE,
+        "sh",
+        "-c",
+        "chown -R 1000:1000 /policy /secrets && chmod 700 /policy /secrets",
     )
 
     try:
@@ -386,5 +404,23 @@ async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -
             "down",
             "--volumes",
             "--remove-orphans",
+            check=False,
+        )
+        _run(
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "-v",
+            f"{policy_dir}:/policy",
+            "-v",
+            f"{signing_key_dir}:/secrets",
+            LOCAL_IMAGE,
+            "chown",
+            "-R",
+            f"{os.getuid()}:{os.getgid()}",
+            "/policy",
+            "/secrets",
             check=False,
         )
