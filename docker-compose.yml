@@ -39,6 +39,16 @@ services:
       PORTUNUSMCP_DEMO_TOTP_SECRET: ${PORTUNUSMCP_DEMO_TOTP_SECRET:-}
       BUSINESS_HOURS_START_UTC: ${BUSINESS_HOURS_START_UTC:-9}
       BUSINESS_HOURS_END_UTC: ${BUSINESS_HOURS_END_UTC:-18}
+      MAX_MCP_BODY_BYTES: ${MAX_MCP_BODY_BYTES:-1048576}
+      MAX_JSON_DEPTH: ${MAX_JSON_DEPTH:-32}
+      MAX_SESSIONS_PER_IDENTITY: ${MAX_SESSIONS_PER_IDENTITY:-3}
+      MAX_INFLIGHT_CALLS_PER_IDENTITY: ${MAX_INFLIGHT_CALLS_PER_IDENTITY:-5}
+      TOOL_CALL_RATE_LIMIT: ${TOOL_CALL_RATE_LIMIT:-60}
+      TOOL_CALL_RATE_WINDOW_SECONDS: ${TOOL_CALL_RATE_WINDOW_SECONDS:-60}
+      TOOL_CALL_DEADLINE_SECONDS: ${TOOL_CALL_DEADLINE_SECONDS:-60}
+      READINESS_TIMEOUT_SECONDS: ${READINESS_TIMEOUT_SECONDS:-1.0}
+      ALLOWED_HOSTS: '${ALLOWED_HOSTS:-["localhost:*","127.0.0.1:*"]}'
+      ALLOWED_ORIGINS: '${ALLOWED_ORIGINS:-[]}'
       # Metrics default to loopback (config.py) so a bare-host run doesn't expose
       # identity ids / tool names. Here the port is unpublished, so the compose
       # network is the boundary and Prometheus needs to reach it.
@@ -64,6 +74,17 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 2s
+      retries: 3
 
   # Detective control (§5): its downtime never blocks gateway traffic.
   verifier:

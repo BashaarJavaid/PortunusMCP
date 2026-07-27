@@ -2,6 +2,7 @@
 
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -15,6 +16,16 @@ class Settings(BaseSettings):
     schema_cache_ttl: int = 600
     session_idle_ttl: int = 300
     shutdown_grace_seconds: int = 5
+    max_mcp_body_bytes: int = Field(default=1048576, gt=0)
+    max_json_depth: int = Field(default=32, gt=0)
+    max_sessions_per_identity: int = Field(default=3, gt=0)
+    max_inflight_calls_per_identity: int = Field(default=5, gt=0)
+    tool_call_rate_limit: int = Field(default=60, gt=0)
+    tool_call_rate_window_seconds: int = Field(default=60, gt=0)
+    tool_call_deadline_seconds: int = Field(default=60, gt=0)
+    readiness_timeout_seconds: float = Field(default=1.0, gt=0)
+    allowed_hosts: list[str] = ["localhost:*", "127.0.0.1:*"]
+    allowed_origins: list[str] = []
     # Half-width of the Replay Guard's accepted timestamp window (±30s, §4.8).
     replay_window_seconds: int = 30
     # Audit-log ECDSA keypair (§4.8): minted via scripts/generate_signing_key.py.

@@ -106,7 +106,7 @@ async def test_auth_failure_spike_raises_every_identitys_calls(
             response = await client.post(
                 f"{telemetry_gateway.url}/mcp/",
                 headers={"X-PortunusMCP-Key": "not-a-real-key"},
-                json={},
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
             )
             assert response.status_code == 401
 

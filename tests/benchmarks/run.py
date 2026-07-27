@@ -345,6 +345,11 @@ async def main() -> None:
     settings.business_hours_start_utc = 0
     settings.business_hours_end_utc = 24
     settings.risk_freq_threshold = 10**9
+    settings.max_sessions_per_identity = max(CONCURRENCY_LEVELS)
+    settings.max_inflight_calls_per_identity = max(CONCURRENCY_LEVELS)
+    settings.tool_call_rate_limit = (
+        WARMUP_CALLS + 2 * n + sum(level * (2 + CALLS_PER_SESSION) for level in CONCURRENCY_LEVELS)
+    )
     for logger_name in (
         "httpx",
         "mcp.client.streamable_http",

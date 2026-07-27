@@ -105,6 +105,8 @@ The full version, including the assumptions the whole model rests on, is in [`TH
 | Replay of a captured request | **Yes for `signed` / Partial for `bearer`** | A `signed` request carries no credential: a byte-identical replay is deduped (`DENY_REPLAY`) and a fresh nonce cannot be re-signed (401 at the edge). `bearer` keeps opportunistic dedup only — the API key travels in the captured request |
 | Tool Poisoning (adversarial text in descriptions) | **Partial** | A description changed after approval blocks until re-approval (default High, item 36a); first-contact baselines are heuristically scanned — a hit is audited (`BASELINE_FLAGGED`) and raises every later call's risk, but flags never block and novel phrasing evades pattern lists. Descriptions still reach the LLM verbatim — Partial is the ceiling |
 | Compromised registered upstream reading gateway secrets | **Yes (scoped)** | Per-session hardened containers receive a minimal allowlisted environment and no gateway secrets directory, Docker socket, or DB/Redis credentials; host/gateway compromise remains out of scope |
+| DNS rebinding against Streamable HTTP | **Yes (scoped)** | The MCP SDK validates every `/mcp/*` Host and supplied Origin against configured allowlists before auth or parsing; the deployment must configure its real public names |
+| Authenticated resource exhaustion / stuck tools | **Partial** | Per-identity sessions, in-flight calls, fixed-window rate limits, bounded bodies/depth, and a 60s call deadline cap one identity; many identities can still exhaust the host, and a deadline cannot undo an upstream side effect already started |
 | Prompt injection via tool *results* | Partial | A protocol-layer gateway can log and rate-limit but not semantically evaluate result content — client/agent-framework responsibility |
 | Stolen API key | Partial | Behavioral risk factors reduce blast radius; a key alone can't be distinguished from its holder. A `signed` identity's secret never appears on the wire at all — stealing it means compromising a host environment |
 | Compromised gateway host | No | The attacker has the signing key — an infra hardening problem, not an application one |
@@ -143,24 +145,48 @@ Afterwards, a plain `docker compose up` deliberately refuses to start: the demo'
 
 **Development setup:** `python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"`, copy `.env.example` to `.env`, set its required Docker namespace/GID values, build the local upstream image with `docker build -t portunusmcp:dev .`, then run `.venv/bin/pytest`. The mounted Docker socket is root-equivalent access to the host; only trusted operators should receive a shell in the gateway container. Full command list in [`CLAUDE.md`](./CLAUDE.md).
 
+### Resource controls and readiness
+
+`GET /health` is process liveness only. `GET /ready` concurrently checks Postgres, Redis, and an in-memory signing/verification probe, returning 200 only when all three are ready (otherwise 503):
+
+```json
+{"status":"ready","checks":{"postgres":"ok","redis":"ok","signing":"ok"}}
+```
+
+The item-40 settings are environment-backed; all numeric values must be positive, and allowlists are JSON arrays:
+
+| Setting | Default |
+|---|---:|
+| `MAX_MCP_BODY_BYTES` | `1048576` |
+| `MAX_JSON_DEPTH` | `32` |
+| `MAX_SESSIONS_PER_IDENTITY` | `3` |
+| `MAX_INFLIGHT_CALLS_PER_IDENTITY` | `5` |
+| `TOOL_CALL_RATE_LIMIT` / `TOOL_CALL_RATE_WINDOW_SECONDS` | `60` / `60` |
+| `TOOL_CALL_DEADLINE_SECONDS` | `60` |
+| `READINESS_TIMEOUT_SECONDS` | `1.0` |
+| `ALLOWED_HOSTS` | `["localhost:*","127.0.0.1:*"]` |
+| `ALLOWED_ORIGINS` | `[]` |
+
+A missing `Origin` remains valid for non-browser MCP clients. Any supplied Origin must be listed.
+
 ---
 
 ## Performance
 
-Measured, not estimated, on **2026-07-26** from the item-39 working tree based on **`b180258`**, with real per-session Docker upstreams and the full §4.2 pipeline active. Methodology, hardware, and reproduction steps: [`ARCHITECTURE.md` §9](./ARCHITECTURE.md#9-performance-benchmarks).
+Measured, not estimated, on **2026-07-27** from the item-40 working tree based on **`d12ddb2`**, with real per-session Docker upstreams and the full §4.2 pipeline plus item-40 edge/rate/deadline controls active. Methodology, hardware, and reproduction steps: [`ARCHITECTURE.md` §9](./ARCHITECTURE.md#9-performance-benchmarks).
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 0.34 / 0.23 / 0.66 / 1.32 ms | 12.87 / 12.25 / 15.49 / 23.45 ms | 12.53 / 12.02 / 14.83 / 22.13 ms |
-| Single call, cold schema cache | 0.34 / 0.23 / 0.66 / 1.32 ms | 15.34 / 14.39 / 18.46 / 39.97 ms | — |
-| 10 concurrent sessions (p95) | — | 163.04 ms | — |
-| 50 concurrent sessions (p95) | — | 1201.06 ms | — |
-| 100 concurrent sessions (p95) | — | 2974.65 ms | — |
+| Single call, cached schema | 0.28 / 0.22 / 0.54 / 1.11 ms | 16.75 / 16.18 / 18.12 / 31.53 ms | 16.47 / 15.95 / 17.58 / 30.42 ms |
+| Single call, cold schema cache | 0.28 / 0.22 / 0.54 / 1.11 ms | 19.57 / 18.93 / 21.86 / 44.81 ms | — |
+| 10 concurrent sessions (p95) | — | 145.98 ms | — |
+| 50 concurrent sessions (p95) | — | 761.38 ms | — |
+| 100 concurrent sessions (p95) | — | 2090.04 ms | — |
 | `tools/list` payload (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
 
 Latencies are mean / p50 / p95 / p99. The high-concurrency p95 includes one hardened Docker container per session as well as the synchronous fail-closed audit write; both are known ceilings, discussed in `ARCHITECTURE.md` §10.
 
-Container initialization: first 512.46 ms; next 20 p50 456.59 ms / p95 626.01 ms. Peak RSS after the 100-session run was 204 MiB (gateway + harness); initialized upstream containers used 1,095 MiB in aggregate.
+Container initialization: first 544.45 ms; next 20 p50 442.97 ms / p95 868.89 ms. Peak RSS after the 100-session run was 212 MiB (gateway + harness); initialized upstream containers used 1,095 MiB in aggregate.
 
 ---
 
@@ -188,7 +214,7 @@ Container initialization: first 512.46 ms; next 20 p50 456.59 ms / p95 626.01 ms
 
 ## Roadmap
 
-Phases 1–5 are complete. **Phase 6 is making the adopted gateway honestly self-hostable.** Item 39 now gives every local upstream a real per-session container boundary; item 40 (resource limits, deadlines, and readiness) is next.
+Phases 1–5 are complete. **Phase 6 is making the adopted gateway honestly self-hostable.** Items 39–40 now provide the upstream isolation boundary plus bounded HTTP/session/call lifecycles and dependency-aware readiness; item 41 (separating the demo stack from a safe single-replica production profile) is next.
 
 Each item in [`ROADMAP.md`](./ROADMAP.md) states the check that proves it done and the threat-model row it upgrades — **an item is finished when that row can be honestly rewritten, not when the code merges.**
 

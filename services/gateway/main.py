@@ -11,9 +11,16 @@ import redis.asyncio as aioredis
 import structlog
 from fastapi import FastAPI, HTTPException, Request
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
+from mcp.server.transport_security import (
+    TransportSecurityMiddleware,
+    TransportSecuritySettings,
+)
+from mcp.types import JSONRPCMessage, JSONRPCNotification, JSONRPCRequest
 from prometheus_client import start_http_server
 from pydantic import BaseModel
-from starlette.responses import Response
+from sqlalchemy import text
+from starlette.requests import HTTPConnection
+from starlette.responses import JSONResponse, Response
 from starlette.types import Receive, Scope, Send
 
 from services.gateway import (
@@ -36,7 +43,13 @@ from services.gateway.policy_engine import PolicyStore
 from services.gateway.replay_guard import ReplayGuard
 from services.gateway.risk_engine import RiskEngine
 from services.gateway.schema_cache import SchemaCache
-from services.gateway.session_manager import SessionManager
+from services.gateway.session_manager import (
+    DuplicateRequestId,
+    InflightLimitExceeded,
+    RateLimiterUnavailable,
+    SessionLimitExceeded,
+    SessionManager,
+)
 from services.gateway.step_up import ChallengeStore
 
 logging_config.configure()
@@ -104,6 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     store = PolicyStore(settings.policy_file)
     app.state.policy_store = store
     signing_key = signing.load_private_key(settings.signing_key_file)
+    app.state.signing_key = signing_key
     runtime = await upstream_client.DockerRuntime.create(store.engine.policy.servers)
     app.state.upstream_runtime = runtime
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
@@ -175,6 +189,47 @@ app = FastAPI(title="PortunusMCP Gateway", lifespan=lifespan)
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+async def _readiness_check(app: FastAPI) -> dict[str, str]:
+    async def postgres() -> None:
+        async with async_session() as session:
+            await session.execute(text("SELECT 1"))
+
+    async def redis() -> None:
+        await app.state.redis.ping()
+
+    async def signing_key() -> None:
+        private_key = app.state.signing_key
+        signature = signing.sign(private_key, "readiness")
+        if not signing.verify(private_key.public_key(), signature, "readiness"):
+            raise ValueError
+
+    checks = {"postgres": postgres, "redis": redis, "signing": signing_key}
+    tasks = {asyncio.create_task(check()): name for name, check in checks.items()}
+    done, pending = await asyncio.wait(tasks, timeout=settings.readiness_timeout_seconds)
+    result = {name: "failed" for name in checks}
+    for task in done:
+        try:
+            task.result()
+        except Exception:
+            pass
+        else:
+            result[tasks[task]] = "ok"
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    return result
+
+
+@app.get("/ready")
+async def ready(request: Request) -> JSONResponse:
+    checks = await _readiness_check(request.app)
+    is_ready = all(value == "ok" for value in checks.values())
+    return JSONResponse(
+        {"status": "ready" if is_ready else "not_ready", "checks": checks},
+        status_code=200 if is_ready else 503,
+    )
 
 
 @app.post("/admin/tools/{server_id}/{tool_name}/approve")
@@ -413,26 +468,75 @@ async def simulate_policy(
     return result.model_dump(mode="json")
 
 
-async def _buffer_body(receive: Receive) -> tuple[bytes, Receive]:
-    """Drain the request body so the edge can verify a signed message before the
-    transport parses it, returning a replayable receive (item 34)."""
-    events: list[MutableMapping[str, Any]] = []
+class _BodyRejected(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        self.status = status
+        self.message = message
+
+
+async def _buffer_body(receive: Receive) -> tuple[bytes, Receive, asyncio.Event]:
+    """Drain a bounded body and return the same bytes through a replayable receive."""
     chunks: list[bytes] = []
+    size = 0
     while True:
         event = await receive()
-        events.append(event)
         if event["type"] != "http.request":
-            break
-        chunks.append(event.get("body", b""))
+            raise _BodyRejected(400, "invalid request body")
+        chunk = event.get("body", b"")
+        size += len(chunk)
+        if size > settings.max_mcp_body_bytes:
+            raise _BodyRejected(413, "request body too large")
+        chunks.append(chunk)
         if not event.get("more_body"):
             break
+    body = b"".join(chunks)
+    replayed = False
+    disconnected = asyncio.Event()
 
     async def replay() -> MutableMapping[str, Any]:
-        if events:
-            return events.pop(0)
-        return await receive()
+        nonlocal replayed
+        if not replayed:
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        event = await receive()
+        if event["type"] == "http.disconnect":
+            disconnected.set()
+        return event
 
-    return b"".join(chunks), replay
+    return body, replay, disconnected
+
+
+def _parse_mcp_body(body: bytes) -> tuple[dict[str, Any], JSONRPCMessage]:
+    try:
+        source = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _BodyRejected(400, "invalid JSON-RPC") from exc
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in source:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > settings.max_json_depth:
+                raise _BodyRejected(400, "JSON depth exceeded")
+        elif char in "]}":
+            depth -= 1
+    try:
+        parsed = json.loads(source)
+        if not isinstance(parsed, dict):
+            raise ValueError
+        return parsed, JSONRPCMessage.model_validate(parsed)
+    except (ValueError, TypeError) as exc:
+        raise _BodyRejected(400, "invalid JSON-RPC") from exc
 
 
 async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
@@ -442,9 +546,41 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
     id must be registered in the policy's `servers:` block. One session = one
     upstream, chosen here at connect time."""
     manager: SessionManager = scope["app"].state.session_manager
-    headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+    security = TransportSecurityMiddleware(
+        TransportSecuritySettings(
+            allowed_hosts=settings.allowed_hosts,
+            allowed_origins=settings.allowed_origins,
+        )
+    )
+    security_failure = await security.validate_request(
+        HTTPConnection(scope), is_post=scope["method"] == "POST"
+    )
+    if security_failure is not None:
+        await security_failure(scope, receive, send)
+        return
+
+    headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
     session_id = headers.get(MCP_SESSION_ID_HEADER)
     engine = scope["app"].state.policy_store.engine
+    parsed: dict[str, Any] | None = None
+    message: JSONRPCMessage | None = None
+    body_disconnected: asyncio.Event | None = None
+
+    if scope["method"] == "POST":
+        content_length = headers.get("content-length")
+        try:
+            if content_length is not None and int(content_length) > settings.max_mcp_body_bytes:
+                raise _BodyRejected(413, "request body too large")
+            if content_length is not None and int(content_length) < 0:
+                raise _BodyRejected(400, "invalid request body")
+            body, receive, body_disconnected = await _buffer_body(receive)
+            parsed, message = _parse_mcp_body(body)
+        except ValueError:
+            await Response("invalid request body", status_code=400)(scope, receive, send)
+            return
+        except _BodyRejected as exc:
+            await Response(exc.message, status_code=exc.status)(scope, receive, send)
+            return
 
     # The mount keeps the full path and puts its own prefix in root_path.
     server_id = scope["path"].removeprefix(scope.get("root_path", "")).strip("/")
@@ -458,15 +594,10 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
             headers.get(KEY_HEADER), engine, scope["app"].state.redis
         )
     elif scope["method"] == "POST":
-        body, receive = await _buffer_body(receive)
-        try:
-            message = json.loads(body)
-        except ValueError:
-            message = None
         identity_id = None
-        if isinstance(message, dict):
+        if parsed is not None:
             identity_id = await auth.verify_signed_request_tracked(
-                message, engine, scope["app"].state.redis
+                parsed, engine, scope["app"].state.redis
             )
     else:
         # GET (SSE stream) / DELETE carry no JSON-RPC body to sign. A signed
@@ -484,6 +615,37 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
         await Response("invalid or missing API key or signature", status_code=401)(
             scope, receive, send
         )
+        return
+
+    root = message.root if message is not None else None
+    is_tool_call = (
+        isinstance(root, JSONRPCRequest | JSONRPCNotification) and root.method == "tools/call"
+    )
+    if is_tool_call:
+        try:
+            retry_after = await manager.check_rate_limit(identity_id)
+        except RateLimiterUnavailable:
+            await Response("rate limiter unavailable", status_code=503)(scope, receive, send)
+            return
+        if retry_after is not None:
+            await Response(
+                "rate limit exceeded",
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )(scope, receive, send)
+            return
+        if isinstance(root, JSONRPCNotification):
+            await Response("tools/call notifications are not supported", status_code=400)(
+                scope, receive, send
+            )
+            return
+
+    if (
+        scope["method"] == "POST"
+        and session_id is None
+        and (not isinstance(root, JSONRPCRequest) or root.method != "initialize")
+    ):
+        await Response("initialize request required", status_code=400)(scope, receive, send)
         return
 
     # After auth, so an unauthenticated probe can't enumerate registered server ids.
@@ -512,6 +674,9 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
         # session (§5: no record, no action).
         try:
             session = await manager.create(identity_id, server_id)
+        except SessionLimitExceeded:
+            await Response("session limit exceeded", status_code=429)(scope, receive, send)
+            return
         except Exception:
             logger.exception("session_creation_failed", identity=identity_id)
             await Response("session could not be created", status_code=503)(scope, receive, send)
@@ -520,7 +685,38 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
         await Response("missing mcp-session-id header", status_code=400)(scope, receive, send)
         return
 
-    await session.transport.handle_request(scope, receive, send)
+    admitted_request_id = None
+    if is_tool_call:
+        assert isinstance(root, JSONRPCRequest)
+        try:
+            await manager.admit_call(session.id, identity_id, root.id)
+            admitted_request_id = root.id
+        except DuplicateRequestId:
+            await Response("duplicate active request id", status_code=400)(scope, receive, send)
+            return
+        except InflightLimitExceeded:
+            await Response("in-flight call limit exceeded", status_code=429)(scope, receive, send)
+            return
+        except LookupError:
+            await Response("session not found", status_code=404)(scope, receive, send)
+            return
+
+    try:
+        await session.transport.handle_request(scope, receive, send)
+    except asyncio.CancelledError:
+        if admitted_request_id is not None:
+            await manager.disconnect_call(session.id, admitted_request_id)
+        raise
+    except BaseException:
+        if admitted_request_id is not None:
+            await manager.finish_call(session.id, admitted_request_id)
+        raise
+    else:
+        if admitted_request_id is not None:
+            if body_disconnected is not None and body_disconnected.is_set():
+                await manager.disconnect_call(session.id, admitted_request_id)
+            else:
+                await manager.finish_call(session.id, admitted_request_id)
     if scope["method"] == "DELETE":
         await manager.teardown(session.id)
 

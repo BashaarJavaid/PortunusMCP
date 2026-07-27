@@ -86,7 +86,10 @@ async def test_rbac_is_isolated_per_server(multi_gateway: Gateway) -> None:
 async def test_unregistered_server_id_is_404(multi_gateway: Gateway) -> None:
     headers = {"X-PortunusMCP-Key": multi_gateway.keys["full"]}
     async with httpx.AsyncClient(headers=headers) as client:
-        response = await client.post(f"{multi_gateway.url}/mcp/gamma", json={})
+        response = await client.post(
+            f"{multi_gateway.url}/mcp/gamma",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
         assert response.status_code == 404
 
 

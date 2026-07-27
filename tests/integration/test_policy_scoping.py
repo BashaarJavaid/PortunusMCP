@@ -57,13 +57,17 @@ async def test_full_identity_sees_and_calls_everything(gateway: Gateway) -> None
 
 async def test_missing_key_is_401(gateway: Gateway) -> None:
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{gateway.url}/mcp/", json={})
+        response = await client.post(
+            f"{gateway.url}/mcp/", json={"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        )
         assert response.status_code == 401
 
 
 async def test_wrong_key_is_401(gateway: Gateway) -> None:
     async with httpx.AsyncClient(headers={"X-PortunusMCP-Key": "not-a-real-key"}) as client:
-        response = await client.post(f"{gateway.url}/mcp/", json={})
+        response = await client.post(
+            f"{gateway.url}/mcp/", json={"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        )
         assert response.status_code == 401
 
 

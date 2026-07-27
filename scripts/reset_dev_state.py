@@ -1,6 +1,6 @@
 """Reset local dev/demo state (ROADMAP item 38). Dev-only and destructive: wipes
 the audit chain, drift baselines, approvals, policy version history, the Redis
-schema/risk/challenge keys, and (from the CLI) the policy revision snapshots.
+schema/risk/challenge/rate keys, and (from the CLI) the policy revision snapshots.
 
 This exists because item 19's fail-closed activation checks are *supposed* to
 refuse a policy version that was already recorded with different content — which
@@ -42,7 +42,7 @@ async def reset_dev_state(clear_snapshots: bool = True) -> None:
     try:
         await redis_client.ping()
         await redis_client.delete(POINTER_KEY)
-        for pattern in ("schema:*", "risk:*", "challenge:*"):
+        for pattern in ("schema:*", "risk:*", "challenge:*", "rate:*"):
             keys = await redis_client.keys(pattern)
             if keys:
                 await redis_client.delete(*keys)

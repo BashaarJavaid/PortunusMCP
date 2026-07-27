@@ -54,6 +54,7 @@ from services.gateway.schema_cache import SchemaCache
 # travels in error.data for policy denials.
 POLICY_DENIED_CODE = -32003
 AUDIT_UNAVAILABLE_CODE = -32004
+TOOL_CALL_DEADLINE_CODE = -32005
 
 _HANDLED_METHODS = frozenset({"initialize", "tools/list", "tools/call"})
 _REFETCH_TIMEOUT_S = 10
@@ -390,9 +391,7 @@ class Interceptor:
             tool=tool_name,
             audit_id=str(seq),
         )
-        metrics.TOOL_CALLS.labels(
-            self.identity_id, self.server_id, tool_name, EventType.ALLOW.value
-        ).inc()
+        await self._record_tool_call(tool_name, EventType.ALLOW)
         _strip_gateway_meta(params)
         return Forward(message)
 
@@ -565,9 +564,7 @@ class Interceptor:
             risk_score=risk_score,
             audit_id=decision.audit_id,
         )
-        metrics.TOOL_CALLS.labels(
-            self.identity_id, self.server_id, tool_name, event_type.value
-        ).inc()
+        await self._record_tool_call(tool_name, event_type)
         if event_type is EventType.DENY_REPLAY:
             metrics.REPLAY_DENIED.inc()
         return _error(
@@ -672,15 +669,24 @@ class Interceptor:
             approval_id=decision.approval_id,
             challenge_id=decision.challenge_id,
         )
-        metrics.TOOL_CALLS.labels(
-            self.identity_id, self.server_id, tool_name, event_type.value
-        ).inc()
+        await self._record_tool_call(tool_name, event_type)
         return _error(
             request.id,
             POLICY_DENIED_CODE,
             reason,
             data=decision.model_dump(mode="json"),
         )
+
+    async def _record_tool_call(self, tool_name: str, event_type: EventType) -> None:
+        """Keep attacker-chosen names out of the Prometheus label set."""
+        label = "other"
+        try:
+            tools = await self.cache.get(self.server_id)
+            if tools is not None and any(tool.get("name") == tool_name for tool in tools):
+                label = tool_name
+        except Exception:
+            pass
+        metrics.TOOL_CALLS.labels(self.identity_id, self.server_id, label, event_type.value).inc()
 
     async def _deny_validation(
         self, request: JSONRPCRequest, tool_name: str, arguments: dict[str, Any], reason: str
