@@ -25,6 +25,32 @@ class ActivationError(Exception):
     """A policy activation that must be rejected (monotonicity or content conflict)."""
 
 
+async def activation_status(
+    engine: PolicyEngine, sessionmaker: async_sessionmaker[AsyncSession]
+) -> tuple[bool, int | None]:
+    """Read-only forward-activation eligibility and the historical maximum."""
+    async with sessionmaker() as session:
+        existing = await session.get(PolicyVersion, engine.version)
+        max_version = (await session.execute(select(func.max(PolicyVersion.version)))).scalar()
+    if existing is not None:
+        if existing.content_hash == engine.content_hash:
+            raise ActivationError(
+                f"policy version {engine.version} is already recorded; activate it via rollback"
+            )
+        raise ActivationError(
+            f"policy version {engine.version} is already recorded with different content"
+        )
+    if max_version is not None and engine.version <= max_version:
+        raise ActivationError(
+            f"policy version {engine.version} is not greater than the highest "
+            f"recorded version {max_version}"
+        )
+    path = snapshot_path(engine.version)
+    if path.exists() and path.read_bytes() != engine.raw:
+        raise ActivationError(f"revision snapshot {path} exists with different content")
+    return True, max_version
+
+
 def snapshot_path(version: int) -> Path:
     return Path(settings.policy_revisions_dir) / f"v{version}.yaml"
 

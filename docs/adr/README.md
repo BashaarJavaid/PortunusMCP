@@ -8,3 +8,5 @@ One file per consequential architecture decision. Load the specific ADR relevant
 - [`ADR-004-no-opa-for-v1.md`](./ADR-004-no-opa-for-v1.md) — No OPA/Rego/Cedar for v1 (auditability-first reasoning)
 - [`ADR-005-no-kubernetes-for-v1.md`](./ADR-005-no-kubernetes-for-v1.md) — Single-replica Compose, no cloud orchestrator for v1
 - [`ADR-006-why-not-alternatives.md`](./ADR-006-why-not-alternatives.md) — Why not Envoy / NGINX / Kong / sidecars / client-SDK middleware
+- [`ADR-007-upstream-container-isolation.md`](./ADR-007-upstream-container-isolation.md) — One hardened upstream container per session
+- [`ADR-008-journaled-operator-mutations.md`](./ADR-008-journaled-operator-mutations.md) — Crash-recoverable policy and audit-key promotion

@@ -40,8 +40,8 @@ async def fetch_rows() -> list[AuditLog]:
 
 
 def run_verifier() -> "subprocess.CompletedProcess[str]":
-    # Point the subprocess at the per-run public key, not any local secrets/ key.
-    env = dict(os.environ, SIGNING_PUBLIC_KEY_FILE=settings.signing_public_key_file)
+    # Point the subprocess at the per-run keyring, not any local secrets/ directory.
+    env = dict(os.environ, SIGNING_PUBLIC_KEYS_DIR=settings.signing_public_keys_dir)
     return subprocess.run(
         [sys.executable, "scripts/verify_audit_chain.py"],
         capture_output=True,

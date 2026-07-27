@@ -98,7 +98,7 @@ async def test_startup_registers_version_snapshot_row_and_audit(
 
 async def test_sighup_bump_snapshots_and_records(versioned_gateway: Gateway) -> None:
     v2 = yaml.safe_dump(_policy(versioned_gateway.keys, version=2, agent_tools=["echo", "add"]))
-    versioned_gateway.policy_path.write_text(v2)
+    versioned_gateway.policy_path.with_name("policy.next.yaml").write_text(v2)
     await sighup_and_wait_for_activation(2)
 
     assert (Path(settings.policy_revisions_dir) / "v2.yaml").read_text() == v2
@@ -110,7 +110,7 @@ async def test_sighup_bump_snapshots_and_records(versioned_gateway: Gateway) -> 
 
 async def test_same_version_different_content_is_rejected(versioned_gateway: Gateway) -> None:
     original_hash = (await version_rows())[0].content_hash
-    versioned_gateway.policy_path.write_text(
+    versioned_gateway.policy_path.with_name("policy.next.yaml").write_text(
         yaml.safe_dump(_policy(versioned_gateway.keys, version=1, agent_tools=["echo", "add"]))
     )
     os.kill(os.getpid(), signal.SIGHUP)
@@ -126,7 +126,7 @@ async def test_same_version_different_content_is_rejected(versioned_gateway: Gat
 
 async def test_rollback_reactivates_prior_revision(versioned_gateway: Gateway) -> None:
     keys = versioned_gateway.keys
-    versioned_gateway.policy_path.write_text(
+    versioned_gateway.policy_path.with_name("policy.next.yaml").write_text(
         yaml.safe_dump(_policy(keys, version=2, agent_tools=["echo", "add"]))
     )
     await sighup_and_wait_for_activation(2)
@@ -140,7 +140,7 @@ async def test_rollback_reactivates_prior_revision(versioned_gateway: Gateway) -
                 headers={"X-PortunusMCP-Key": keys["ops-admin"]},
             )
         assert response.status_code == 200
-        decision = response.json()
+        decision = response.json()["decision"]
         assert decision["event_type"] == "POLICY_ACTIVATED"
         assert decision["policy_version"] == 1
 
@@ -174,7 +174,7 @@ async def test_rollback_authz_and_missing_version(versioned_gateway: Gateway) ->
 async def test_rollback_rejects_unavailable_runtime(
     versioned_gateway: Gateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    versioned_gateway.policy_path.write_text(
+    versioned_gateway.policy_path.with_name("policy.next.yaml").write_text(
         yaml.safe_dump(_policy(versioned_gateway.keys, version=2))
     )
     await sighup_and_wait_for_activation(2)

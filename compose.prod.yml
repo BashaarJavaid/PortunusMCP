@@ -90,8 +90,9 @@ services:
       DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
       REDIS_URL: redis://default:${REDIS_PASSWORD}@redis:6379/0
       POLICY_FILE: /app/config/policy.yaml
-      POLICY_REVISIONS_DIR: /app/policies/revisions
+      POLICY_REVISIONS_DIR: /app/config/revisions
       SIGNING_KEY_FILE: /app/secrets/audit_signing_key.pem
+      SIGNING_PUBLIC_KEYS_DIR: /app/secrets/public
       MAX_MCP_BODY_BYTES: ${MAX_MCP_BODY_BYTES}
       MAX_JSON_DEPTH: ${MAX_JSON_DEPTH}
       MAX_SESSIONS_PER_IDENTITY: ${MAX_SESSIONS_PER_IDENTITY}
@@ -128,9 +129,8 @@ services:
     group_add:
       - ${DOCKER_GID:?set DOCKER_GID to the docker.sock group id}
     volumes:
-      - ${POLICY_FILE_HOST:?set POLICY_FILE_HOST}:/app/config/policy.yaml:ro
-      - ${POLICY_REVISIONS_DIR_HOST:?set POLICY_REVISIONS_DIR_HOST}:/app/policies/revisions
-      - ${AUDIT_SIGNING_PRIVATE_KEY_FILE:?set AUDIT_SIGNING_PRIVATE_KEY_FILE}:/app/secrets/audit_signing_key.pem:ro
+      - ${POLICY_DIR_HOST:?set POLICY_DIR_HOST}:/app/config
+      - ${AUDIT_SIGNING_KEY_DIR:?set AUDIT_SIGNING_KEY_DIR}:/app/secrets
       - /var/run/docker.sock:/var/run/docker.sock
     tmpfs:
       - /tmp:uid=1000,gid=1000,mode=1777
@@ -165,12 +165,12 @@ services:
     command: python scripts/audit_verifier_daemon.py
     environment:
       DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
-      SIGNING_PUBLIC_KEY_FILE: /app/secrets/audit_signing_key.pub.pem
+      SIGNING_PUBLIC_KEYS_DIR: /app/secrets/public
       VERIFY_INTERVAL_SECONDS: ${VERIFY_INTERVAL_SECONDS}
       METRICS_PORT: "9101"
       METRICS_HOST: 0.0.0.0
     volumes:
-      - ${AUDIT_SIGNING_PUBLIC_KEY_FILE:?set AUDIT_SIGNING_PUBLIC_KEY_FILE}:/app/secrets/audit_signing_key.pub.pem:ro
+      - ${AUDIT_SIGNING_KEY_DIR:?set AUDIT_SIGNING_KEY_DIR}/public:/app/secrets/public:ro
     tmpfs:
       - /tmp:uid=1000,gid=1000,mode=1777
     networks: [edge, data]

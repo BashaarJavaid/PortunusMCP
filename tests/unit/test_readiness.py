@@ -9,9 +9,27 @@ from services.gateway.config import settings
 from services.gateway.main import _readiness_check, app
 
 
+def set_ready_state(*, signing_available: bool = True, policy_blocked: bool = False) -> None:
+    key = signing.ec.generate_private_key(signing.ec.SECP256R1())
+    key_id = signing.key_id(key.public_key())
+    app.state.audit_writer = SimpleNamespace(available=signing_available, key_id=key_id)
+    app.state.audit_key_store = SimpleNamespace(
+        initialize=lambda: (key, key_id),
+        load_public=lambda _key_id: key.public_key(),
+        read_journal=lambda: None,
+    )
+    app.state.policy_operations = SimpleNamespace(blocked=policy_blocked, read_journal=lambda: None)
+    app.state.legacy_key_backfill_complete = True
+
+
+class Result:
+    def scalar_one_or_none(self) -> None:
+        return None
+
+
 async def test_ready_exact_body_and_health_stays_liveness() -> None:
     redis = SimpleNamespace(ping=AsyncMock())
-    key = signing.ec.generate_private_key(signing.ec.SECP256R1())
+    set_ready_state()
 
     class Session:
         async def __aenter__(self) -> "Session":
@@ -20,11 +38,10 @@ async def test_ready_exact_body_and_health_stays_liveness() -> None:
         async def __aexit__(self, *args: object) -> None:
             pass
 
-        async def execute(self, statement: object) -> None:
-            pass
+        async def execute(self, statement: object) -> Result:
+            return Result()
 
     app.state.redis = redis
-    app.state.signing_key = key
     with patch("services.gateway.main.async_session", return_value=Session()):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -32,14 +49,18 @@ async def test_ready_exact_body_and_health_stays_liveness() -> None:
             assert response.status_code == 200
             assert response.json() == {
                 "status": "ready",
-                "checks": {"postgres": "ok", "redis": "ok", "signing": "ok"},
+                "checks": {
+                    "postgres": "ok",
+                    "redis": "ok",
+                    "signing": "ok",
+                    "policy": "ok",
+                },
             }
             assert (await client.get("/health")).json() == {"status": "ok"}
 
 
 async def test_readiness_names_failures_without_exception_text() -> None:
-    key = signing.ec.generate_private_key(signing.ec.SECP256R1())
-    app.state.signing_key = key
+    set_ready_state(signing_available=False, policy_blocked=True)
     app.state.redis = SimpleNamespace(ping=AsyncMock(side_effect=RuntimeError("secret redis")))
 
     class BrokenSession:
@@ -49,10 +70,7 @@ async def test_readiness_names_failures_without_exception_text() -> None:
         async def __aexit__(self, *args: object) -> None:
             pass
 
-    with (
-        patch("services.gateway.main.async_session", return_value=BrokenSession()),
-        patch("services.gateway.main.signing.verify", return_value=False),
-    ):
+    with patch("services.gateway.main.async_session", return_value=BrokenSession()):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/ready")
@@ -63,6 +81,7 @@ async def test_readiness_names_failures_without_exception_text() -> None:
                     "postgres": "failed",
                     "redis": "failed",
                     "signing": "failed",
+                    "policy": "failed",
                 },
             }
             assert (await client.get("/health")).status_code == 200
@@ -72,8 +91,7 @@ async def test_readiness_names_failures_without_exception_text() -> None:
 async def test_readiness_uses_one_overall_timeout() -> None:
     old_timeout = settings.readiness_timeout_seconds
     settings.readiness_timeout_seconds = 0.01
-    key = signing.ec.generate_private_key(signing.ec.SECP256R1())
-    app.state.signing_key = key
+    set_ready_state()
 
     async def slow() -> None:
         await asyncio.sleep(1)
@@ -93,12 +111,15 @@ async def test_readiness_uses_one_overall_timeout() -> None:
             result = await _readiness_check(app)
     finally:
         settings.readiness_timeout_seconds = old_timeout
-    assert result == {"postgres": "failed", "redis": "failed", "signing": "ok"}
+    assert result == {
+        "postgres": "failed",
+        "redis": "failed",
+        "signing": "ok",
+        "policy": "ok",
+    }
 
 
 async def test_readiness_dependencies_fail_independently() -> None:
-    app.state.signing_key = signing.ec.generate_private_key(signing.ec.SECP256R1())
-
     def session_type(broken: bool) -> type:
         class Session:
             async def __aenter__(self) -> "Session":
@@ -109,25 +130,20 @@ async def test_readiness_dependencies_fail_independently() -> None:
             async def __aexit__(self, *args: object) -> None:
                 pass
 
-            async def execute(self, statement: object) -> None:
-                pass
+            async def execute(self, statement: object) -> Result:
+                return Result()
 
         return Session
 
-    for failed in ("postgres", "redis", "signing"):
+    for failed in ("postgres", "redis", "signing", "policy"):
+        set_ready_state(signing_available=failed != "signing", policy_blocked=failed == "policy")
         app.state.redis = SimpleNamespace(
             ping=AsyncMock(side_effect=RuntimeError if failed == "redis" else None)
         )
 
-        with (
-            patch(
-                "services.gateway.main.async_session",
-                return_value=session_type(failed == "postgres")(),
-            ),
-            patch(
-                "services.gateway.main.signing.verify",
-                return_value=failed != "signing",
-            ),
+        with patch(
+            "services.gateway.main.async_session",
+            return_value=session_type(failed == "postgres")(),
         ):
             result = await _readiness_check(app)
         assert result[failed] == "failed"

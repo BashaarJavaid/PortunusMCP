@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     # Audit-log ECDSA keypair (§4.8): minted via scripts/generate_signing_key.py.
     # A gateway with no usable private key must not start (§5, fail closed).
     signing_key_file: str = "secrets/audit_signing_key.pem"
+    signing_public_keys_dir: str = "secrets/public"
+    # Compatibility path for callers that still need the pre-item-42 single public
+    # key during the explicit production-directory migration. The gateway/verifier
+    # use signing_public_keys_dir.
     signing_public_key_file: str = "secrets/audit_signing_key.pub.pem"
     # Risk Engine v1 (§4.8, item 16). Business hours are Mon-Fri in UTC — v1 has no
     # per-identity timezone; a policy timezone field is a documented later extension.

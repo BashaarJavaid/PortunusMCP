@@ -18,28 +18,36 @@ from mcp.server.transport_security import (
 from mcp.types import JSONRPCMessage, JSONRPCNotification, JSONRPCRequest
 from prometheus_client import start_http_server
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import case, func, select, text
 from starlette.requests import HTTPConnection
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from services.gateway import (
+    audit_export,
     auth,
     decision_explainer,
     logging_config,
     policy_engine,
     policy_simulator,
     policy_versions,
-    signing,
     upstream_client,
 )
 from services.gateway.approvals import ApprovalStore
+from services.gateway.audit_keys import AuditKeyStore
 from services.gateway.audit_log import AuditWriter
+from services.gateway.audit_verification import backfill_legacy_key_ids
 from services.gateway.config import settings
-from services.gateway.db import AuditLog, async_session
+from services.gateway.db import Approval, AuditLog, PolicyVersion, ToolBaseline, async_session
 from services.gateway.decision import Decision, DecisionOutcome, EventType
-from services.gateway.drift_detector import DriftDetector
+from services.gateway.drift_detector import (
+    REMOVED_SENTINEL,
+    DriftDetector,
+    classify,
+    scan_descriptions,
+)
 from services.gateway.policy_engine import PolicyStore
+from services.gateway.policy_operations import PolicyOperationStore
 from services.gateway.replay_guard import ReplayGuard
 from services.gateway.risk_engine import RiskEngine
 from services.gateway.schema_cache import SchemaCache
@@ -56,6 +64,7 @@ logging_config.configure()
 logger = structlog.get_logger(__name__)
 
 KEY_HEADER = "x-portunusmcp-key"
+ADMIN_BODY_LIMIT = 1024 * 1024
 
 
 async def _reload_policy(
@@ -63,33 +72,97 @@ async def _reload_policy(
     writer: AuditWriter,
     manager: SessionManager,
     runtime: upstream_client.DockerRuntime,
+    operations: PolicyOperationStore,
+    lock: asyncio.Lock,
 ) -> None:
-    old_version = store.engine.version
-    candidate = store.load_candidate()
-    if candidate is None:
-        return  # last-known-good stays active; failure already logged
+    path = operations.manual_candidate_path
+    if not path.exists():
+        logger.warning("policy_reload_skipped", detail=f"{path} does not exist")
+        return
     try:
-        await runtime.preflight(candidate.policy.servers)
-        # Record before swap (item 19): a rejected or unrecordable activation keeps
-        # last-known-good (§5 fail-closed).
-        await policy_versions.record_activation(candidate, "operator", async_session)
+        candidate = policy_engine.load_bytes(path.read_bytes())
+        if not any(identity.admin for identity in candidate.policy.identities):
+            raise ValueError("candidate policy must contain at least one admin identity")
+        await _activate_policy(
+            candidate,
+            activated_by="operator",
+            kind="sighup",
+            store=store,
+            writer=writer,
+            manager=manager,
+            runtime=runtime,
+            operations=operations,
+            lock=lock,
+        )
+        path.unlink()
     except Exception:
         logger.exception("policy_activation_rejected_keeping_last_known_good")
-        return
-    store.swap(candidate)
-    await manager.evict_outdated()
+
+
+async def _activate_policy(
+    candidate: policy_engine.PolicyEngine,
+    *,
+    activated_by: str,
+    kind: str,
+    store: PolicyStore,
+    writer: AuditWriter,
+    manager: SessionManager,
+    runtime: upstream_client.DockerRuntime,
+    operations: PolicyOperationStore,
+    lock: asyncio.Lock,
+    rollback: bool = False,
+) -> tuple[int, int]:
+    if lock.locked():
+        raise RuntimeError("another policy mutation is already in progress")
+    await lock.acquire()
+    operation = None
+    handed_off = False
+    old_version = store.engine.version
     try:
-        await writer.write(
+        if operations.blocked or operations.read_journal() is not None:
+            raise RuntimeError("policy activation recovery is pending")
+        await runtime.preflight(candidate.policy.servers)
+        if not rollback:
+            await policy_versions.activation_status(candidate, async_session)
+        operation = operations.prepare(
+            candidate.raw,
+            kind=kind,
+            activated_by=activated_by,
+            old_version=old_version,
+            new_version=candidate.version,
+        )
+        if rollback:
+            await policy_versions.record_rollback(candidate, activated_by, async_session)
+        else:
+            await policy_versions.record_activation(candidate, activated_by, async_session)
+        seq = await writer.write(
             EventType.POLICY_ACTIVATED,
-            "operator",
+            activated_by,
             payload_extra={
                 "old_version": old_version,
-                "new_version": store.engine.version,
-                "content_hash": store.engine.content_hash,
+                "new_version": candidate.version,
+                "content_hash": candidate.content_hash,
+                "rollback": rollback,
+                "operation_id": operation.operation_id,
+                "source": kind,
+                "durable": True,
             },
         )
+        operation = operations.mark_handoff(operation, seq)
+        handed_off = True
+        operations.promote(operation)
+        store.swap(candidate)
+        await manager.evict_outdated()
+        operations.finish()
+        return seq, old_version
     except Exception:
-        logger.exception("audit_write_failed", event_type="POLICY_ACTIVATED")
+        if handed_off:
+            operations.blocked = True
+        elif operation is not None:
+            operations.abort_before_handoff()
+        raise
+    finally:
+        lock.release()
 
 
 async def _record_startup_activation(engine: policy_engine.PolicyEngine) -> None:
@@ -115,15 +188,24 @@ async def _record_startup_activation(engine: policy_engine.PolicyEngine) -> None
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # An invalid or missing policy file must fail startup (ARCHITECTURE.md §5);
     # so must a missing/unreadable audit signing key (§4.8, item 11).
+    policy_operations = PolicyOperationStore(settings.policy_file)
+    await policy_operations.recover(async_session)
+    app.state.policy_operations = policy_operations
+    app.state.policy_mutation_lock = asyncio.Lock()
+    app.state.key_rotation_lock = asyncio.Lock()
     store = PolicyStore(settings.policy_file)
     app.state.policy_store = store
-    signing_key = signing.load_private_key(settings.signing_key_file)
+    key_store = AuditKeyStore(settings.signing_key_file, settings.signing_public_keys_dir)
+    signing_key, key_id = await key_store.recover(async_session)
+    await backfill_legacy_key_ids(async_session, key_store, key_id)
+    app.state.legacy_key_backfill_complete = True
+    app.state.audit_key_store = key_store
     app.state.signing_key = signing_key
     runtime = await upstream_client.DockerRuntime.create(store.engine.policy.servers)
     app.state.upstream_runtime = runtime
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
     app.state.redis = redis_client  # auth-failure counter (§4.8, item 18)
-    writer = AuditWriter(redis_client, async_session, store, signing_key)
+    writer = AuditWriter(redis_client, async_session, store, signing_key, key_id)
     app.state.audit_writer = writer  # rollback endpoint (item 19)
     # Record + audit the boot-time activation (item 19). A monotonicity conflict
     # (e.g. same version, different content) fails startup; the snapshot/row are
@@ -170,7 +252,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(
         signal.SIGHUP,
-        lambda: loop.create_task(_reload_policy(store, writer, manager, runtime)),
+        lambda: loop.create_task(
+            _reload_policy(
+                store,
+                writer,
+                manager,
+                runtime,
+                policy_operations,
+                app.state.policy_mutation_lock,
+            )
+        ),
     )
     try:
         yield
@@ -201,12 +292,25 @@ async def _readiness_check(app: FastAPI) -> dict[str, str]:
         await app.state.redis.ping()
 
     async def signing_key() -> None:
-        private_key = app.state.signing_key
-        signature = signing.sign(private_key, "readiness")
-        if not signing.verify(private_key.public_key(), signature, "readiness"):
+        writer: AuditWriter = app.state.audit_writer
+        key_store: AuditKeyStore = app.state.audit_key_store
+        if not writer.available:
+            raise ValueError
+        private_key, active_key_id = key_store.initialize()
+        if active_key_id != writer.key_id:
+            raise ValueError
+        public_key = key_store.load_public(writer.key_id)
+        if public_key.public_numbers() != private_key.public_key().public_numbers():
+            raise ValueError
+        if not app.state.legacy_key_backfill_complete or key_store.read_journal() is not None:
             raise ValueError
 
-    checks = {"postgres": postgres, "redis": redis, "signing": signing_key}
+    async def policy() -> None:
+        operations: PolicyOperationStore = app.state.policy_operations
+        if operations.blocked or operations.read_journal() is not None:
+            raise ValueError
+
+    checks = {"postgres": postgres, "redis": redis, "signing": signing_key, "policy": policy}
     tasks = {asyncio.create_task(check()): name for name, check in checks.items()}
     done, pending = await asyncio.wait(tasks, timeout=settings.readiness_timeout_seconds)
     result = {name: "failed" for name in checks}
@@ -298,11 +402,7 @@ async def approve_call(approval_id: str, request: Request) -> dict[str, object]:
 
 @app.post("/admin/policy/rollback/{version}")
 async def rollback_policy(version: int, request: Request) -> dict[str, object]:
-    """Re-activate a prior policy revision (§4.8, item 19): loads the append-only
-    snapshot, verifies it against the recorded content_hash, swaps the in-memory
-    PolicyStore, and refreshes the policy_versions row. In-memory only — POLICY_FILE
-    on disk is mounted read-only and keeps the newer version until the operator
-    updates it; a restart re-activates whatever is on disk (audited)."""
+    """Durably re-activate a prior policy revision."""
     store: PolicyStore = request.app.state.policy_store
     identity_id = await auth.resolve_identity_tracked(
         request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
@@ -318,38 +418,21 @@ async def rollback_policy(version: int, request: Request) -> dict[str, object]:
         engine = policy_engine.load_bytes(snapshot.read_bytes())
     except Exception as exc:
         raise HTTPException(status_code=409, detail=f"revision v{version} is invalid") from exc
-    runtime: upstream_client.DockerRuntime = request.app.state.upstream_runtime
     try:
-        await runtime.preflight(engine.policy.servers)
-    except upstream_client.RuntimeError as exc:
+        seq, old_version = await _activate_policy(
+            engine,
+            activated_by=identity_id,
+            kind="rollback",
+            store=store,
+            writer=request.app.state.audit_writer,
+            manager=request.app.state.session_manager,
+            runtime=request.app.state.upstream_runtime,
+            operations=request.app.state.policy_operations,
+            lock=request.app.state.policy_mutation_lock,
+            rollback=True,
+        )
+    except Exception as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    try:
-        await policy_versions.record_rollback(engine, identity_id, async_session)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except policy_versions.ActivationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    old_version = store.engine.version
-    writer: AuditWriter = request.app.state.audit_writer
-    seq = await writer.write(
-        EventType.POLICY_ACTIVATED,
-        identity_id,
-        payload_extra={
-            "old_version": old_version,
-            "new_version": engine.version,
-            "content_hash": engine.content_hash,
-            "rollback": True,
-        },
-    )
-    store.swap(engine)
-    manager: SessionManager = request.app.state.session_manager
-    await manager.evict_outdated()
-    logger.warning(
-        "policy_rolled_back_in_memory_only",
-        old_version=old_version,
-        new_version=engine.version,
-        hint="POLICY_FILE on disk still holds the newer version; update it or a restart reverts",
-    )
     decision = Decision(
         decision=DecisionOutcome.ALLOW,
         event_type=EventType.POLICY_ACTIVATED,
@@ -358,7 +441,10 @@ async def rollback_policy(version: int, request: Request) -> dict[str, object]:
         policy_version=engine.version,
         audit_id=str(seq),
     )
-    return decision.model_dump(mode="json")
+    return {
+        "decision": decision.model_dump(mode="json"),
+        "metadata": {"old_version": old_version, "new_version": engine.version},
+    }
 
 
 async def _require_admin(request: Request) -> str:
@@ -372,6 +458,134 @@ async def _require_admin(request: Request) -> str:
     if not store.engine.is_admin(identity_id):
         raise HTTPException(status_code=403, detail="admin identity required")
     return identity_id
+
+
+def _approval_view(row: Approval, audit_row: AuditLog) -> dict[str, object]:
+    decision = decision_explainer.from_audit_row(audit_row)
+    return {
+        "approval_id": row.approval_id,
+        "status": row.status,
+        "consumed": row.consumed,
+        "created_at": row.created_at.isoformat(),
+        "expires_at": row.expires_at.isoformat(),
+        "approved_at": row.approved_at.isoformat() if row.approved_at else None,
+        "approved_by": row.approved_by,
+        "identity": row.identity_id,
+        "server": row.server_id,
+        "tool": row.tool_name,
+        "arguments_hash": row.arguments_hash,
+        "arguments": (audit_row.payload or {}).get("arguments", {}),
+        "decision": decision.model_dump(mode="json"),
+    }
+
+
+@app.get("/admin/approvals")
+async def list_approvals(request: Request) -> dict[str, object]:
+    await _require_admin(request)
+    try:
+        await request.app.state.approval_store.expire_stale()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="approval expiry audit failed") from exc
+    async with async_session() as session:
+        result = await session.execute(
+            select(Approval, AuditLog)
+            .join(AuditLog, AuditLog.seq == Approval.audit_id)
+            .where(Approval.status == "pending")
+            .order_by(Approval.expires_at, Approval.approval_id)
+            .limit(101)
+        )
+        rows = list(result.all())
+    return {
+        "items": [_approval_view(row, audit_row) for row, audit_row in rows[:100]],
+        "truncated": len(rows) > 100,
+    }
+
+
+@app.get("/admin/approvals/{approval_id}")
+async def get_approval(approval_id: str, request: Request) -> dict[str, object]:
+    await _require_admin(request)
+    try:
+        await request.app.state.approval_store.expire_stale()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="approval expiry audit failed") from exc
+    async with async_session() as session:
+        result = await session.execute(
+            select(Approval, AuditLog)
+            .join(AuditLog, AuditLog.seq == Approval.audit_id)
+            .where(Approval.approval_id == approval_id)
+        )
+        pair = result.one_or_none()
+    if pair is None:
+        raise HTTPException(status_code=404, detail="unknown approval id")
+    return _approval_view(*pair)
+
+
+def _baseline_view(row: ToolBaseline) -> dict[str, object]:
+    observed = row.observed_schema
+    removed = row.observed_hash == REMOVED_SENTINEL
+    severity = None
+    if removed:
+        severity = "medium"
+    elif observed is not None:
+        severity_value = classify(row.approved_schema, observed)
+        severity = (severity_value.name if severity_value else "high").lower()
+    return {
+        "server": row.server_id,
+        "tool": row.tool_name,
+        "approved_schema": row.approved_schema,
+        "approved_hash": row.approved_hash,
+        "approved_at": row.approved_at.isoformat(),
+        "observed_schema": observed,
+        "observed_hash": row.observed_hash,
+        "blocked": row.blocked,
+        "removed": removed,
+        "severity": severity,
+        "suspicious": row.suspicious,
+        "flagged_at": row.flagged_at.isoformat() if row.flagged_at else None,
+        "scanner_findings": {
+            "approved": scan_descriptions(row.approved_schema),
+            "observed": scan_descriptions(observed) if observed is not None else [],
+        },
+    }
+
+
+@app.get("/admin/baselines/flagged")
+async def list_flagged_baselines(request: Request, kind: str = "all") -> dict[str, object]:
+    await _require_admin(request)
+    if kind not in {"all", "drift", "suspicious"}:
+        raise HTTPException(status_code=400, detail="kind must be all, drift, or suspicious")
+    conditions = {
+        "all": (ToolBaseline.observed_hash.is_not(None) | ToolBaseline.suspicious),
+        "drift": ToolBaseline.observed_hash.is_not(None),
+        "suspicious": ToolBaseline.suspicious,
+    }
+    async with async_session() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(ToolBaseline)
+                    .where(conditions[kind])
+                    .order_by(
+                        case((ToolBaseline.observed_hash.is_not(None), 0), else_=1),
+                        ToolBaseline.flagged_at,
+                        ToolBaseline.server_id,
+                        ToolBaseline.tool_name,
+                    )
+                    .limit(101)
+                )
+            ).scalars()
+        )
+    return {"items": [_baseline_view(row) for row in rows[:100]], "truncated": len(rows) > 100}
+
+
+@app.get("/admin/baselines/{server_id}/{tool_name}")
+async def get_baseline(server_id: str, tool_name: str, request: Request) -> dict[str, object]:
+    await _require_admin(request)
+    async with async_session() as session:
+        row = await session.get(ToolBaseline, (server_id, tool_name))
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown baseline")
+    return _baseline_view(row)
 
 
 @app.get("/admin/decisions/{seq}")
@@ -469,14 +683,253 @@ async def simulate_policy(
     return result.model_dump(mode="json")
 
 
+def _require_yaml(request: Request) -> None:
+    if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/yaml":
+        raise HTTPException(status_code=415, detail="Content-Type must be application/yaml")
+
+
+async def _candidate(request: Request) -> policy_engine.PolicyEngine:
+    _require_yaml(request)
+    raw = await request.body()
+    try:
+        raw.decode("utf-8")
+        return policy_engine.load_bytes(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid policy: {exc}") from exc
+
+
+def _require_admin_candidate(engine: policy_engine.PolicyEngine) -> None:
+    if not any(identity.admin for identity in engine.policy.identities):
+        raise HTTPException(
+            status_code=409, detail="candidate policy must contain at least one admin identity"
+        )
+
+
+@app.get("/admin/policy")
+async def policy_status(request: Request) -> dict[str, object]:
+    await _require_admin(request)
+    store: PolicyStore = request.app.state.policy_store
+    operations: PolicyOperationStore = request.app.state.policy_operations
+    operation = operations.read_journal()
+    async with async_session() as session:
+        recorded = (
+            await session.execute(select(func.max(PolicyVersion.version)))
+        ).scalar_one_or_none()
+    return {
+        "active_version": store.engine.version,
+        "content_hash": store.engine.content_hash,
+        "highest_recorded_version": recorded,
+        "mutation_in_progress": request.app.state.policy_mutation_lock.locked(),
+        "recovery_required": operations.blocked or operation is not None,
+        "operation": operation.__dict__ if operation else None,
+        "candidate_path": str(operations.manual_candidate_path),
+    }
+
+
+@app.get("/admin/policy/revisions")
+async def policy_revisions(request: Request) -> dict[str, object]:
+    await _require_admin(request)
+    active_version = request.app.state.policy_store.engine.version
+    async with async_session() as session:
+        versions = list(
+            (
+                await session.execute(
+                    select(PolicyVersion).order_by(PolicyVersion.version.desc()).limit(101)
+                )
+            ).scalars()
+        )
+        activations = list(
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.event_type == EventType.POLICY_ACTIVATED.value)
+                )
+            ).scalars()
+        )
+    activated_versions = {
+        row.payload.get("new_version")
+        for row in activations
+        if isinstance((row.payload or {}).get("new_version"), int)
+    }
+    items = [
+        {
+            "version": row.version,
+            "content_hash": row.content_hash,
+            "activated_at": row.activated_at.isoformat(),
+            "activated_by": row.activated_by,
+            "state": (
+                "active"
+                if row.version == active_version
+                else "inactive"
+                if row.version in activated_versions
+                else "recorded-unactivated"
+            ),
+        }
+        for row in versions[:100]
+    ]
+    return {"items": items, "truncated": len(versions) > 100}
+
+
+@app.post("/admin/policy/validate")
+async def validate_policy(request: Request) -> dict[str, object]:
+    identity_id = await _require_admin(request)
+    engine = await _candidate(request)
+    _require_admin_candidate(engine)
+    if auth.resolve_identity(
+        request.headers.get(KEY_HEADER), engine
+    ) != identity_id or not engine.is_admin(identity_id):
+        raise HTTPException(
+            status_code=409,
+            detail="the calling bearer key must remain an admin in the candidate policy",
+        )
+    try:
+        _, highest = await policy_versions.activation_status(engine, async_session)
+        await request.app.state.upstream_runtime.preflight(engine.policy.servers)
+    except (policy_versions.ActivationError, upstream_client.RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "valid": True,
+        "version": engine.version,
+        "content_hash": engine.content_hash,
+        "highest_recorded_version": highest,
+        "servers": sorted(engine.policy.servers),
+        "identities": len(engine.policy.identities),
+    }
+
+
+@app.post("/admin/policy/simulate-candidate")
+async def simulate_candidate_policy(request: Request, replay_window: str) -> dict[str, object]:
+    await _require_admin(request)
+    engine = await _candidate(request)
+    try:
+        result = await policy_simulator.simulate_candidate(
+            engine,
+            replay_window,
+            sessionmaker=async_session,
+            detector=request.app.state.drift_detector,
+            risk=request.app.state.risk_engine,
+            schema_cache=SchemaCache(request.app.state.redis),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result.model_dump(mode="json")
+
+
+@app.post("/admin/policy/rollout")
+async def rollout_policy(request: Request) -> dict[str, object]:
+    identity_id = await _require_admin(request)
+    engine = await _candidate(request)
+    _require_admin_candidate(engine)
+    if auth.resolve_identity(
+        request.headers.get(KEY_HEADER), engine
+    ) != identity_id or not engine.is_admin(identity_id):
+        raise HTTPException(
+            status_code=409,
+            detail="the calling bearer key must remain an admin in the candidate policy",
+        )
+    try:
+        seq, old_version = await _activate_policy(
+            engine,
+            activated_by=identity_id,
+            kind="api",
+            store=request.app.state.policy_store,
+            writer=request.app.state.audit_writer,
+            manager=request.app.state.session_manager,
+            runtime=request.app.state.upstream_runtime,
+            operations=request.app.state.policy_operations,
+            lock=request.app.state.policy_mutation_lock,
+        )
+    except (policy_versions.ActivationError, upstream_client.RuntimeError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    decision = Decision(
+        decision=DecisionOutcome.ALLOW,
+        event_type=EventType.POLICY_ACTIVATED,
+        reason=f"policy v{engine.version} activated by {identity_id!r}",
+        matched_rules=["admin_rollout"],
+        policy_version=engine.version,
+        audit_id=str(seq),
+    )
+    return {
+        "decision": decision.model_dump(mode="json"),
+        "metadata": {"old_version": old_version, "new_version": engine.version},
+    }
+
+
+@app.get("/admin/keys/audit")
+async def audit_key_status(request: Request) -> dict[str, object]:
+    await _require_admin(request)
+    writer: AuditWriter = request.app.state.audit_writer
+    key_store: AuditKeyStore = request.app.state.audit_key_store
+    operation = key_store.read_journal()
+    return {
+        "active_key_id": writer.key_id,
+        "available": writer.available,
+        "public_key_count": key_store.public_count(),
+        "rotation_in_progress": request.app.state.key_rotation_lock.locked(),
+        "recovery_required": operation is not None or not writer.available,
+        "operation": operation.__dict__ if operation else None,
+    }
+
+
+@app.post("/admin/keys/audit/rotate")
+async def rotate_audit_key(request: Request) -> dict[str, object]:
+    identity_id = await _require_admin(request)
+    lock: asyncio.Lock = request.app.state.key_rotation_lock
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="another audit key rotation is in progress")
+    await lock.acquire()
+    try:
+        writer: AuditWriter = request.app.state.audit_writer
+        seq, old_key_id, new_key_id = await writer.rotate(
+            request.app.state.audit_key_store, identity_id
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        lock.release()
+    decision = Decision(
+        decision=DecisionOutcome.ALLOW,
+        event_type=EventType.AUDIT_KEY_ROTATED,
+        reason=f"audit signing key rotated by {identity_id!r}",
+        matched_rules=["admin_key_rotation"],
+        policy_version=request.app.state.policy_store.engine.version,
+        audit_id=str(seq),
+    )
+    return {
+        "decision": decision.model_dump(mode="json"),
+        "metadata": {"old_key_id": old_key_id, "new_key_id": new_key_id},
+    }
+
+
+@app.get("/admin/audit/export")
+async def export_audit(
+    request: Request, from_seq: int | None = None, to_seq: int | None = None
+) -> StreamingResponse:
+    await _require_admin(request)
+    try:
+        manifest, start, end = await audit_export.prepare(
+            async_session, request.app.state.audit_key_store, from_seq, to_seq
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    headers = {"Content-Disposition": 'attachment; filename="portunusmcp-audit.ndjson"'}
+    return StreamingResponse(
+        audit_export.stream(async_session, manifest, start, end),
+        media_type="application/x-ndjson",
+        headers=headers,
+    )
+
+
 class _BodyRejected(Exception):
     def __init__(self, status: int, message: str) -> None:
         self.status = status
         self.message = message
 
 
-async def _buffer_body(receive: Receive) -> tuple[bytes, Receive, asyncio.Event]:
+async def _buffer_body(
+    receive: Receive, limit: int | None = None
+) -> tuple[bytes, Receive, asyncio.Event]:
     """Drain a bounded body and return the same bytes through a replayable receive."""
+    limit = settings.max_mcp_body_bytes if limit is None else limit
     chunks: list[bytes] = []
     size = 0
     while True:
@@ -485,7 +938,7 @@ async def _buffer_body(receive: Receive) -> tuple[bytes, Receive, asyncio.Event]
             raise _BodyRejected(400, "invalid request body")
         chunk = event.get("body", b"")
         size += len(chunk)
-        if size > settings.max_mcp_body_bytes:
+        if size > limit:
             raise _BodyRejected(413, "request body too large")
         chunks.append(chunk)
         if not event.get("more_body"):
@@ -546,6 +999,12 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
     Path-based upstream routing (item 35): clients connect to /mcp/{server_id}; the
     id must be registered in the policy's `servers:` block. One session = one
     upstream, chosen here at connect time."""
+    if scope["app"].state.policy_operations.blocked:
+        await Response("policy activation recovery pending", status_code=503)(scope, receive, send)
+        return
+    if not scope["app"].state.audit_writer.available:
+        await Response("audit key rotation recovery pending", status_code=503)(scope, receive, send)
+        return
     manager: SessionManager = scope["app"].state.session_manager
     security = TransportSecurityMiddleware(
         TransportSecuritySettings(
@@ -722,4 +1181,34 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
         await manager.teardown(session.id)
 
 
+class _AdminBodyLimitMiddleware:
+    def __init__(self, application: Any) -> None:
+        self.application = application
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] == "http"
+            and scope["path"].startswith("/admin/")
+            and scope["method"] in {"POST", "PUT", "PATCH"}
+        ):
+            headers = {
+                key.decode("latin-1").lower(): value.decode("latin-1")
+                for key, value in scope["headers"]
+            }
+            try:
+                content_length = headers.get("content-length")
+                if content_length is not None and int(content_length) < 0:
+                    raise _BodyRejected(400, "invalid request body")
+                if content_length is not None and int(content_length) > ADMIN_BODY_LIMIT:
+                    raise _BodyRejected(413, "request body too large")
+                _, receive, _ = await _buffer_body(receive, ADMIN_BODY_LIMIT)
+            except (ValueError, _BodyRejected) as exc:
+                status = exc.status if isinstance(exc, _BodyRejected) else 400
+                message = exc.message if isinstance(exc, _BodyRejected) else "invalid request body"
+                await Response(message, status_code=status)(scope, receive, send)
+                return
+        await self.application(scope, receive, send)
+
+
+app.add_middleware(_AdminBodyLimitMiddleware)
 app.mount("/mcp", mcp_endpoint)

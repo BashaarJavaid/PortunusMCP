@@ -66,6 +66,7 @@ from services.gateway.replay_guard import (  # noqa: E402
 GATEWAY = "http://localhost:8000"
 ROOT = Path(__file__).parent.parent
 POLICY_PATH = ROOT / "policies" / "demo-policy.yaml"
+POLICY_NEXT_PATH = ROOT / "policies" / "demo-policy.next.yaml"
 RUNTIME_NAMESPACE = os.environ.get("UPSTREAM_RUNTIME_NAMESPACE", "")
 
 RECEIPT_EVENTS = [
@@ -131,11 +132,12 @@ def write_policy(
     ci_key_id: str,
     version: int = 1,
     developer_tools: list[str] | None = None,
+    path: Path = POLICY_PATH,
 ) -> None:
     def key_hash(identity: str) -> str:
         return f"sha256:{hashlib.sha256(keys[identity].encode()).hexdigest()}"
 
-    POLICY_PATH.write_text(
+    path.write_text(
         yaml.safe_dump(
             {
                 "version": version,
@@ -428,8 +430,14 @@ async def simulate_draft_policy(keys: dict[str, str], ci_key_id: str) -> None:
     simulator replays against (item 19/21), so the draft is hot-loaded first — the
     simulation itself is read-only and writes nothing."""
     section("policy simulation — preview a tightened v2 policy against today's traffic")
-    write_policy(keys, ci_key_id, version=2, developer_tools=["read_inbox"])
-    print("  v2 draft written to policies/demo-policy.yaml: developer LOSES send_email.")
+    write_policy(
+        keys,
+        ci_key_id,
+        version=2,
+        developer_tools=["read_inbox"],
+        path=POLICY_NEXT_PATH,
+    )
+    print("  v2 draft written to policies/demo-policy.next.yaml: developer LOSES send_email.")
     print("  In another terminal:  docker kill -s HUP portunusmcp-demo-gateway-1")
     print("  (hot-reloads v2 and records the revision snapshot the simulator needs)")
     today = time.strftime("%Y-%m-%d", time.gmtime())

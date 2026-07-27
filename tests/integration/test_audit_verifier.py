@@ -83,7 +83,7 @@ async def test_forged_chain_is_caught_and_checkpoint_stops(gateway: Gateway) -> 
 
 
 def run_full_scan() -> "subprocess.CompletedProcess[str]":
-    env = dict(os.environ, SIGNING_PUBLIC_KEY_FILE=settings.signing_public_key_file)
+    env = dict(os.environ, SIGNING_PUBLIC_KEYS_DIR=settings.signing_public_keys_dir)
     return subprocess.run(
         [sys.executable, "scripts/verify_audit_chain.py"],
         capture_output=True,

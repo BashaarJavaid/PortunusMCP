@@ -25,7 +25,15 @@ from tests.integration.test_policy_scoping import connect
 async def fetch_events() -> list[tuple[str, int]]:
     async with async_session() as db:
         rows = (await db.execute(select(AuditLog).order_by(AuditLog.seq))).scalars()
-        return [(row.event_type, row.policy_version) for row in rows]
+        return [
+            (
+                row.event_type,
+                row.payload.get("new_version", row.policy_version)
+                if row.event_type == "POLICY_ACTIVATED"
+                else row.policy_version,
+            )
+            for row in rows
+        ]
 
 
 async def sighup_and_wait_for_activation(version: int) -> None:
@@ -44,7 +52,7 @@ async def test_sighup_reload_applies_to_inflight_session(gateway: Gateway) -> No
         with pytest.raises(McpError):  # v1 policy: readonly may not call add
             await session.call_tool("add", {"a": 1, "b": 2})
 
-        gateway.policy_path.write_text(
+        gateway.policy_path.with_name("policy.next.yaml").write_text(
             yaml.safe_dump(policy_dict(gateway.keys, readonly_tools=["echo", "add"], version=2))
         )
         await sighup_and_wait_for_activation(2)
@@ -62,7 +70,7 @@ async def test_sighup_reload_applies_to_inflight_session(gateway: Gateway) -> No
 
 async def test_broken_reload_keeps_last_known_good(gateway: Gateway) -> None:
     async with connect(gateway.url, gateway.keys["agent-full"]) as session:
-        gateway.policy_path.write_text("version: [broken\n")
+        gateway.policy_path.with_name("policy.next.yaml").write_text("version: [broken\n")
         os.kill(os.getpid(), signal.SIGHUP)
         await asyncio.sleep(0.3)
 
@@ -81,7 +89,9 @@ async def test_runtime_preflight_failure_keeps_last_known_good(
         "preflight",
         AsyncMock(side_effect=upstream_client.RuntimeError("image missing")),
     )
-    gateway.policy_path.write_text(yaml.safe_dump(policy_dict(gateway.keys, version=2)))
+    gateway.policy_path.with_name("policy.next.yaml").write_text(
+        yaml.safe_dump(policy_dict(gateway.keys, version=2))
+    )
     os.kill(os.getpid(), signal.SIGHUP)
     await asyncio.sleep(0.3)
 
@@ -132,7 +142,9 @@ async def test_etag_stable_then_changes_on_policy_reload(gateway: Gateway) -> No
         assert etag.startswith("1-")
         assert second.meta is not None and second.meta["etag"] == etag  # stable
 
-        gateway.policy_path.write_text(yaml.safe_dump(policy_dict(gateway.keys, version=2)))
+        gateway.policy_path.with_name("policy.next.yaml").write_text(
+            yaml.safe_dump(policy_dict(gateway.keys, version=2))
+        )
         await sighup_and_wait_for_activation(2)
 
         third = await session.list_tools()

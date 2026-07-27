@@ -13,9 +13,14 @@ from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from services.gateway.audit_keys import AuditKeyStore
+
 SECRETS_DIR = Path(__file__).parent.parent / "secrets"
 PRIVATE_PATH = SECRETS_DIR / "audit_signing_key.pem"
 PUBLIC_PATH = SECRETS_DIR / "audit_signing_key.pub.pem"
+PUBLIC_DIR = SECRETS_DIR / "public"
 
 if PRIVATE_PATH.exists():
     print(f"refusing to overwrite existing key: {PRIVATE_PATH}")
@@ -36,5 +41,7 @@ PUBLIC_PATH.write_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
     )
 )
+_, key_id = AuditKeyStore(str(PRIVATE_PATH), str(PUBLIC_DIR)).initialize()
 print(f"private key: {PRIVATE_PATH}")
 print(f"public key:  {PUBLIC_PATH}")
+print(f"key id:      {key_id}")

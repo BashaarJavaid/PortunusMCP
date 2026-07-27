@@ -66,7 +66,7 @@ graph TD
     Approvals --> PG
     Explainer --> PG
     Simulator --> PG
-    Policy --> Rev["policies/revisions/ snapshots (rw submount)"]
+    Policy --> Rev["policy root: active file, staging journal, revision snapshots"]
     Simulator --> Rev
 
     Verifier["audit_verifier sidecar (separate process, read-only chain walk)"] --> PG
@@ -163,7 +163,12 @@ docker compose --env-file .env.prod -f compose.prod.yml up -d
 
 Release workflow summaries print the exact immutable gateway reference. The official Postgres, Redis, Prometheus and Grafana repositories publish their manifest digests; place those `sha256:...` values in `.env.prod`. Every production `servers:` image should likewise be `repository@sha256:...` and must already exist on the host because runtime pulling is disabled.
 
-The active policy is mounted as one read-only file. On Linux, make the private key owned by UID/GID 1000 with mode `0400`, the revision directory owned by 1000:1000 with mode `0700`, and the active policy/public key read-only (`0444`). The verifier receives only the public key. `.env.prod.gateway` contains only policy-referenced `PORTUNUSMCP_UPSTREAM_*`, signing and TOTP secrets. Postgres and Redis are password-protected and reachable only on the internal data network; neither publishes a host port.
+Production now mounts two operator-owned, writable roots into the gateway:
+
+- `POLICY_DIR_HOST` (mode `0700`, UID/GID 1000) contains `policy.yaml`; the gateway creates crash-recovery staging/journal files and `revisions/` beneath it.
+- `AUDIT_SIGNING_KEY_DIR` (mode `0700`, UID/GID 1000) contains `audit_signing_key.pem`; the gateway maintains `public/<fingerprint>.pub.pem` and the rotation journal beneath it. The verifier receives only that `public/` directory read-only.
+
+Private files and journals are mode `0600`; archived public keys are `0444`. `.env.prod.gateway` contains only policy-referenced `PORTUNUSMCP_UPSTREAM_*`, signing and TOTP secrets. Postgres and Redis are password-protected and reachable only on the internal data network; neither publishes a host port.
 
 The gateway binds to `127.0.0.1:${GATEWAY_PORT:-8000}`. Put an operator-managed TLS reverse proxy in front of it and set `ALLOWED_HOSTS`/`ALLOWED_ORIGINS` to the real public names. Internal gateway-to-database traffic is plaintext inside the isolated single-host Compose network.
 
@@ -177,10 +182,10 @@ Do not scale `gateway`: session/container handles are in memory and the audit ch
 
 ### Resource controls and readiness
 
-`GET /health` is process liveness only. `GET /ready` concurrently checks Postgres, Redis, and an in-memory signing/verification probe, returning 200 only when all three are ready (otherwise 503):
+`GET /health` is process liveness only. `GET /ready` concurrently checks Postgres, Redis, the active audit key/keyring/recovery state, and policy-promotion recovery state, returning 200 only when all four are ready (otherwise 503):
 
 ```json
-{"status":"ready","checks":{"postgres":"ok","redis":"ok","signing":"ok"}}
+{"status":"ready","checks":{"postgres":"ok","redis":"ok","signing":"ok","policy":"ok"}}
 ```
 
 The item-40 settings are environment-backed; all numeric values must be positive, and allowlists are JSON arrays:
@@ -198,6 +203,34 @@ The item-40 settings are environment-backed; all numeric values must be positive
 | `ALLOWED_ORIGINS` | `[]` |
 
 A missing `Origin` remains valid for non-browser MCP clients. Any supplied Origin must be listed.
+
+### Operator CLI
+
+The package installs `portunusmcp`, a stdlib-only operator client for the authenticated `/admin` API. Put the admin credential only in the environment; it is never accepted as a command-line argument:
+
+```bash
+export PORTUNUSMCP_URL=https://gateway.example.com
+export PORTUNUSMCP_ADMIN_KEY='shown-once-admin-key'
+
+portunusmcp approvals list
+portunusmcp baselines list --kind all
+portunusmcp baselines show default send_email
+portunusmcp decisions get 42
+portunusmcp policy validate candidate.yaml
+portunusmcp policy simulate candidate.yaml --window 2026-07-01..2026-07-27
+portunusmcp --yes policy rollout candidate.yaml
+portunusmcp --yes policy rollback 3
+portunusmcp keys audit-status
+portunusmcp --yes keys rotate-audit
+portunusmcp audit export --from-seq 1 --to-seq 500 --output audit.ndjson
+.venv/bin/python scripts/verify_audit_chain.py --export audit.ndjson
+```
+
+Mutations confirm interactively unless `--yes`; JSON-mode mutations require `--yes`. `--json` emits stable pretty JSON for automation. Plain HTTP is accepted only for `localhost`, `127.0.0.1`, or `::1`; remote operators must use HTTPS, optionally with `--ca-file`.
+
+Policy rollout and rollback use one crash-recoverable journal: validate and preflight, record the revision, write the old-policy-signed `POLICY_ACTIVATED` handoff, atomically promote `policy.yaml`, then swap memory. SIGHUP follows the same path by consuming adjacent `policy.next.yaml`; a rejected candidate stays there for correction. Audit-key rotation similarly writes `AUDIT_KEY_ROTATED` with the old key before promoting the new private key. Historical public keys are fingerprint-addressed and retained so old rows remain verifiable.
+
+Approvals and flagged baselines are bounded review queues (100 rows per response). Audit export is verified before download and emits self-contained NDJSON: one manifest with the exact public-key bundle followed by inclusive, gap-free rows. A partial range proves its internal chain and signatures but explicitly does not attest the omitted prefix.
 
 ---
 
@@ -244,7 +277,7 @@ Container initialization: first 544.45 ms; next 20 p50 442.97 ms / p95 868.89 ms
 
 ## Roadmap
 
-Phases 1–5 are complete. **Phase 6 is making the adopted gateway honestly self-hostable.** Items 39–41 provide the upstream isolation boundary, bounded HTTP/session/call lifecycles, dependency-aware readiness, and separate explicit demo/production Compose profiles. Item 42, the operator CLI/API, is next.
+Phases 1–5 are complete. **Phase 6 is making the adopted gateway honestly self-hostable.** Items 39–42 provide the upstream isolation boundary, bounded lifecycles/readiness, explicit demo/production profiles, and the operator CLI/API. Item 43 is next.
 
 Each item in [`ROADMAP.md`](./ROADMAP.md) states the check that proves it done and the threat-model row it upgrades — **an item is finished when that row can be honestly rewritten, not when the code merges.**
 

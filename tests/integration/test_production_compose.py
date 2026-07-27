@@ -7,6 +7,7 @@ import os
 import secrets
 import socket
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -80,10 +81,6 @@ def _require_docker() -> None:
 
 def _write_env(
     tmp_path: Path,
-    policy: Path,
-    revisions: Path,
-    private_key: Path,
-    public_key: Path,
 ) -> tuple[Path, Path, dict[str, int]]:
     ports = {
         "gateway": _free_port(),
@@ -102,10 +99,8 @@ def _write_env(
         "REDIS_PASSWORD": secrets.token_urlsafe(32),
         "GRAFANA_ADMIN_USER": "compose-admin",
         "GRAFANA_ADMIN_PASSWORD": secrets.token_urlsafe(32),
-        "POLICY_FILE_HOST": str(policy),
-        "POLICY_REVISIONS_DIR_HOST": str(revisions),
-        "AUDIT_SIGNING_PRIVATE_KEY_FILE": str(private_key),
-        "AUDIT_SIGNING_PUBLIC_KEY_FILE": str(public_key),
+        "POLICY_DIR_HOST": str(tmp_path),
+        "AUDIT_SIGNING_KEY_DIR": str(tmp_path),
         "UPSTREAM_RUNTIME_NAMESPACE": f"prod-test-{uuid.uuid4().hex[:8]}",
         "DOCKER_GID": _docker_socket_gid(),
         "GATEWAY_PORT": str(ports["gateway"]),
@@ -197,10 +192,9 @@ async def _wait_ready(url: str) -> None:
 async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -> None:
     _require_docker()
     tmp_path.chmod(0o755)
-    revisions = tmp_path / "revisions"
-    revisions.mkdir(mode=0o777)
-    revisions.chmod(0o777)
-    private_key, public_key = write_signing_keypair(tmp_path)
+    (tmp_path / "revisions").mkdir(mode=0o777)
+    (tmp_path / "public").mkdir(mode=0o777)
+    private_key, _ = write_signing_keypair(tmp_path)
     private_key.chmod(0o644)  # test runner UID can differ from the image's UID 1000
 
     api_key = secrets.token_urlsafe(32)
@@ -219,6 +213,7 @@ async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -
                     {
                         "id": "developer",
                         "api_key_hash": f"sha256:{hashlib.sha256(api_key.encode()).hexdigest()}",
+                        "admin": True,
                         "allowed_servers": [
                             {
                                 "server_id": "default",
@@ -231,7 +226,7 @@ async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -
         )
     )
     policy.chmod(0o644)
-    env_file, _, ports = _write_env(tmp_path, policy, revisions, private_key, public_key)
+    env_file, _, ports = _write_env(tmp_path)
     project = f"portunusmcp-prod-test-{uuid.uuid4().hex[:8]}"
 
     rendered = _render(env_file, project)
@@ -346,6 +341,43 @@ async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -
                     result = await session.call_tool("read_file", {"path": "README.md"})
                     assert isinstance(result.content[0], TextContent)
                     assert result.content[0].text == "<contents of README.md>"
+
+        cli = str(Path(sys.executable).with_name("portunusmcp"))
+        cli_env = {
+            **os.environ,
+            "PORTUNUSMCP_URL": f"http://127.0.0.1:{ports['gateway']}",
+            "PORTUNUSMCP_ADMIN_KEY": api_key,
+        }
+        status = json.loads(_run(cli, "--json", "policy", "status", env=cli_env))
+        assert status["active_version"] == 1
+        shown = json.loads(
+            _run(
+                cli,
+                "--json",
+                "baselines",
+                "show",
+                "default",
+                "read_file",
+                env=cli_env,
+            )
+        )
+        assert shown["tool"] == "read_file"
+        export = tmp_path / "audit.ndjson"
+        exported = json.loads(
+            _run(
+                cli,
+                "--json",
+                "audit",
+                "export",
+                "--output",
+                str(export),
+                env=cli_env,
+            )
+        )
+        assert exported["rows"] > 0
+        assert "export OK" in _run(
+            sys.executable, "scripts/verify_audit_chain.py", "--export", str(export)
+        )
     finally:
         _compose(
             env_file,

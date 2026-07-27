@@ -63,13 +63,9 @@ services:
     group_add:
       - ${DOCKER_GID:?set DOCKER_GID to the docker.sock group id}
     volumes:
-      # Host-editable policies: edit + `docker kill -s HUP portunusmcp-demo-gateway-1`.
-      # Read-only so a compromised gateway can't persist a policy backdoor; only the
-      # revisions submount is writable, for activation snapshots (item 19).
-      - ./policies:/app/policies:ro
-      - ./policies/revisions:/app/policies/revisions
-      # Audit signing keypair: mint once via `python scripts/generate_signing_key.py`.
-      - ./secrets:/app/secrets:ro
+      # Item 42 owns policy promotion and audit-key rotation inside these roots.
+      - ./policies:/app/policies
+      - ./secrets:/app/secrets
       # Trusted gateway-only Docker control plane. Per-session upstreams never receive it.
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
@@ -98,12 +94,13 @@ services:
     command: python scripts/audit_verifier_daemon.py
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://portunusmcp:portunusmcp@postgres:5432/portunusmcp}
+      SIGNING_PUBLIC_KEYS_DIR: /app/secrets/public
       VERIFY_INTERVAL_SECONDS: ${VERIFY_INTERVAL_SECONDS:-60}
       METRICS_PORT: "9101"
       METRICS_HOST: "0.0.0.0"
     volumes:
-      # Only the public key is read; the private key never enters this container.
-      - ./secrets/audit_signing_key.pub.pem:/app/secrets/audit_signing_key.pub.pem:ro
+      # Only the append-only public keyring is read; private keys never enter here.
+      - ./secrets/public:/app/secrets/public:ro
     depends_on:
       postgres:
         condition: service_healthy

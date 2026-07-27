@@ -155,6 +155,7 @@ def policy_dict(
             {
                 "id": "agent-full",
                 "api_key_hash": _key_hash(keys["agent-full"]),
+                "admin": True,
                 "allowed_servers": [{"server_id": "*", "allowed_tools": ["*"]}],
             },
         ],
@@ -204,12 +205,14 @@ async def running_gateway(
     old_policy_file = settings.policy_file
     old_signing_key = settings.signing_key_file
     old_signing_pub = settings.signing_public_key_file
+    old_signing_pub_dir = settings.signing_public_keys_dir
     old_revisions_dir = settings.policy_revisions_dir
     settings.policy_file = str(policy_path)
     settings.policy_revisions_dir = str(policy_path.parent / "revisions")
     private_path, public_path = write_signing_keypair(policy_path.parent)
     settings.signing_key_file = str(private_path)
     settings.signing_public_key_file = str(public_path)
+    settings.signing_public_keys_dir = str(policy_path.parent / "public")
 
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -237,6 +240,7 @@ async def running_gateway(
             settings.policy_file = old_policy_file
             settings.signing_key_file = old_signing_key
             settings.signing_public_key_file = old_signing_pub
+            settings.signing_public_keys_dir = old_signing_pub_dir
             settings.policy_revisions_dir = old_revisions_dir
             server.should_exit = True
             await task

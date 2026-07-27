@@ -20,7 +20,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.gateway import metrics, signing
-from services.gateway.audit_log import GENESIS_HASH, compute_hash
+from services.gateway.audit_keys import AuditKeyStore
+from services.gateway.audit_log import GENESIS_HASH
+from services.gateway.audit_verification import AuditRecord, verify_record
 from services.gateway.db import AuditLog, VerifierCheckpoint
 
 logger = structlog.get_logger(__name__)
@@ -30,7 +32,7 @@ CHECKPOINT_ID = 1
 
 async def verify_increment(
     sessionmaker: async_sessionmaker[AsyncSession],
-    public_key: ec.EllipticCurvePublicKey,
+    public_keys: AuditKeyStore | ec.EllipticCurvePublicKey,
 ) -> tuple[int, str | None]:
     """One verification pass from the checkpoint forward. Returns (rows verified this
     pass, failure description or None). The checkpoint advances only through the last
@@ -47,23 +49,36 @@ async def verify_increment(
                 return 0, f"checkpoint row seq={last_verified} is missing from audit_log"
             prev_hash = anchor.curr_hash
 
+        if isinstance(public_keys, ec.EllipticCurvePublicKey):
+            legacy_id = signing.key_id(public_keys)
+
+            def load_public_key(key_id: str) -> ec.EllipticCurvePublicKey:
+                if key_id != legacy_id:
+                    raise ValueError(f"missing public key {key_id}")
+                return public_keys
+
+        else:
+            legacy_id = None
+            load_public_key = public_keys.load_public
+
         verified = 0
         failure: str | None = None
         rows = await session.stream_scalars(
             select(AuditLog).where(AuditLog.seq > last_verified).order_by(AuditLog.seq)
         )
         async for row in rows:
-            if row.prev_hash != prev_hash:
-                failure = f"BROKEN LINK at seq={row.seq}: prev_hash does not continue the chain"
-            elif compute_hash(prev_hash, row.payload) != row.curr_hash:
-                failure = f"TAMPERED ROW at seq={row.seq}: payload does not match curr_hash"
-            elif not signing.verify(public_key, row.signature, row.curr_hash):
-                failure = f"BAD SIGNATURE at seq={row.seq}: curr_hash was not signed by the gateway"
-            if failure is not None:
+            try:
+                prev_hash = verify_record(
+                    AuditRecord.from_row(row),
+                    prev_hash,
+                    load_public_key,
+                    legacy_key_id=legacy_id,
+                )
+            except (OSError, ValueError) as exc:
+                failure = str(exc)
                 logger.error("audit_chain_verification_failed", failure=failure, seq=row.seq)
                 metrics.AUDIT_VERIFY_FAILURES.inc()
                 break
-            prev_hash = row.curr_hash
             last_verified = row.seq
             verified += 1
 

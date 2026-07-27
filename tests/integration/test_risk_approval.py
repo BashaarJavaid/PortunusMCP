@@ -9,7 +9,11 @@ unit-tested) and lowering the frequency-spike threshold to 2: echo is tiered med
 70 → HUMAN_APPROVAL_REQUIRED, and one decay step (-5, behavioral only) makes the
 same call score 65 → CHALLENGE."""
 
+import asyncio
+import json
+import os
 import secrets
+import subprocess
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -103,12 +107,41 @@ async def test_risk_scoring_and_approval_lifecycle(risk_gateway: Gateway) -> Non
             )
             assert response.status_code == 403
 
-            response = await client.post(
-                f"{risk_gateway.url}/admin/approvals/{approval_id}/approve",
-                headers={"X-PortunusMCP-Key": risk_gateway.keys["ops-admin"]},
+            headers = {"X-PortunusMCP-Key": risk_gateway.keys["ops-admin"]}
+            listing = await client.get(f"{risk_gateway.url}/admin/approvals", headers=headers)
+            assert listing.status_code == 200
+            assert listing.json()["items"][0]["approval_id"] == approval_id
+            detail = await client.get(
+                f"{risk_gateway.url}/admin/approvals/{approval_id}", headers=headers
             )
-        assert response.status_code == 200
-        assert response.json()["event_type"] == "APPROVED"
+            assert detail.status_code == 200
+            assert detail.json()["arguments"] == {"text": "prod-db"}
+            assert detail.json()["decision"]["event_type"] == "HUMAN_APPROVAL_REQUIRED"
+
+        cli = str(Path(sys.executable).with_name("portunusmcp"))
+        cli_env = {
+            **os.environ,
+            "PORTUNUSMCP_URL": risk_gateway.url,
+            "PORTUNUSMCP_ADMIN_KEY": risk_gateway.keys["ops-admin"],
+        }
+        listed = await asyncio.to_thread(
+            subprocess.run,
+            [cli, "--json", "approvals", "list"],
+            capture_output=True,
+            text=True,
+            env=cli_env,
+        )
+        assert listed.returncode == 0, listed.stderr
+        assert json.loads(listed.stdout)["items"][0]["approval_id"] == approval_id
+        approved = await asyncio.to_thread(
+            subprocess.run,
+            [cli, "--json", "--yes", "approvals", "approve", approval_id],
+            capture_output=True,
+            text=True,
+            env=cli_env,
+        )
+        assert approved.returncode == 0, approved.stderr
+        assert json.loads(approved.stdout)["event_type"] == "APPROVED"
 
         # TOCTOU: the retry carries mutated arguments — neither version forwards.
         with pytest.raises(McpError) as excinfo:

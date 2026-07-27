@@ -33,6 +33,8 @@ class AuditLog(Base):
     curr_hash: Mapped[str] = mapped_column(CHAR(64))
     # ECDSA-SHA256 (DER) over curr_hash, signed by the gateway's private key (item 11).
     signature: Mapped[bytes] = mapped_column(LargeBinary)
+    # Nullable only for the item-42 verified startup backfill of historical rows.
+    key_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )
@@ -72,6 +74,8 @@ class ToolBaseline(Base):
     # Item 36b: the approved content matched the description heuristics — feeds the
     # suspicious_baseline risk factor; a flag, never a block.
     suspicious: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
+    # Oldest time this baseline entered either drift or suspicious review.
+    flagged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Approval(Base):
