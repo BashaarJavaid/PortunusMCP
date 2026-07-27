@@ -2,8 +2,8 @@
 
 **Status:** Accepted
 
-**Decision:** Deploy on Docker Compose (local/MVP) and AWS ECS Fargate (production), not Kubernetes/EKS.
+**Decision:** Ship two explicit Docker Compose deployments for v1: an unsafe local demo profile and one hardened, single-host, single-gateway-replica production profile. Do not build Kubernetes/EKS, ECS/Fargate, or Terraform yet.
 
-**Reasoning:** A single stateless proxy service doesn't need Kubernetes's scheduling/autoscaling machinery to demonstrate that the architecture is horizontally scalable — that claim is demonstrated in the deployment diagram in `ARCHITECTURE.md` (multiple stateless replicas behind a load balancer, sharing Redis/Postgres), not by standing up a live cluster. ECS Fargate provides the same "runs in production on real cloud infrastructure" credibility with a fraction of the operational surface area a K8s cluster requires to run and maintain correctly.
+**Reasoning:** The current gateway is not stateless or horizontally safe: session objects and per-session Docker handles are process-local, and two audit writers can fork the hash chain. A cloud orchestrator would package those correctness limits rather than remove them. The production Compose profile provides the deployment boundary the code can honestly support today; Terraform/ECS becomes appropriate only after a concrete cloud deployment is wanted and remains roadmap item 24.
 
-**Alternatives considered:** EKS, self-managed Kubernetes, Nomad.
+**Alternatives considered:** ECS Fargate + Terraform, EKS, self-managed Kubernetes, Nomad, and implying multi-replica readiness through a future-state diagram.

@@ -104,7 +104,8 @@ async def _record_startup_activation(engine: policy_engine.PolicyEngine) -> None
         hint = (
             f"{exc} — leftover dev/demo state? reset with:"
             " python scripts/reset_dev_state.py (in docker:"
-            " docker compose run --rm gateway python scripts/reset_dev_state.py --yes)"
+            " docker compose --env-file .env.demo -f compose.demo.yml run --rm gateway"
+            " python scripts/reset_dev_state.py --yes)"
         )
         logger.error("policy_activation_conflict_at_startup", detail=hint)
         raise policy_versions.ActivationError(hint) from exc

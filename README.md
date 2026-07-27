@@ -117,33 +117,63 @@ The full version, including the assumptions the whole model rests on, is in [`TH
 ## Run the demo
 
 ```bash
+cp .env.demo.example .env.demo
 python scripts/generate_signing_key.py   # once: audit signing keypair (gateway won't start without it)
 python scripts/run_demo.py               # resets demo state, mints keys, writes policies/demo-policy.yaml, waits
 ```
 
 ```bash
-# First set UPSTREAM_RUNTIME_NAMESPACE in .env and set DOCKER_GID to:
+# First set UPSTREAM_RUNTIME_NAMESPACE and DOCKER_GID in .env.demo. Find the GID with:
 # docker run --rm -v /var/run/docker.sock:/var/run/docker.sock docker:29.6.1-cli \
 #   stat -c '%g' /var/run/docker.sock
 #
 # In another terminal (the rogue upstream container lives in the policy's servers: block):
 POLICY_FILE=policies/demo-policy.yaml \
-  docker compose up -d --build
+  docker compose --env-file .env.demo -f compose.demo.yml up -d --build
 
 # when the driver prompts — the rug pull, deliberately on screen:
 curl -X POST localhost:9800/_admin/apply_mutation
 
 # when it prompts again — hot-load the tightened v2 policy for the simulation finale:
-docker kill -s HUP portunusmcp-gateway-1
+docker kill -s HUP portunusmcp-demo-gateway-1
 ```
 
 The driver connects as `developer` — a stock MCP client, no custom `_meta` on the first call (sees only `send_email` / `read_inbox`; the destructive `delete_mailbox` is *absent*, not marked), then as `ops-admin` (sees all three). It makes a successful call, waits for the operator's mutation curl, then shows the drift classified Critical and blocked (`DENY_DRIFT`), the admin re-approval, and the same call succeeding after a TOTP step-up if current risk requires it. It then shows the `signed` ci-agent's captured request replayed byte-identically (`DENY_REPLAY`) and with a forged fresh nonce (HTTP 401), followed by Policy Simulation of the v2 draft (`would_now_deny: 2`) and the hash-chained audit receipts.
 
 All seven beats are live — nothing is scripted or faked. The mutation fires only when the operator actually calls that endpoint, so the adversarial event is visible on camera rather than happening off-screen on a timer.
 
-Afterwards, a plain `docker compose up` deliberately refuses to start: the demo's policy v1 is on record with different content, and the fail-closed activation check catches it. The startup error names the fix — `docker compose run --rm gateway python scripts/reset_dev_state.py --yes` (dev-only: wipes the local audit chain and demo state, never the check).
+If later demo policy v1 content conflicts with recorded state, the fail-closed activation check refuses startup and names the dev-only reset: `docker compose --env-file .env.demo -f compose.demo.yml run --rm gateway python scripts/reset_dev_state.py --yes`. The check is not weakened.
 
-**Development setup:** `python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"`, copy `.env.example` to `.env`, set its required Docker namespace/GID values, build the local upstream image with `docker build -t portunusmcp:dev .`, then run `.venv/bin/pytest`. The mounted Docker socket is root-equivalent access to the host; only trusted operators should receive a shell in the gateway container. Full command list in [`CLAUDE.md`](./CLAUDE.md).
+**Development setup:** `python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"`, copy `.env.demo.example` to `.env.demo`, set its required Docker namespace/GID values, build the local upstream image with `docker build -t portunusmcp:dev .`, then run `.venv/bin/pytest`. The mounted Docker socket is root-equivalent access to the host; only trusted operators should receive a shell in the gateway container. Full command list in [`CLAUDE.md`](./CLAUDE.md).
+
+## Self-host the production profile
+
+`compose.prod.yml` is a hardened **single-host, single-gateway-replica** profile. It is intentionally not selected by a bare `docker compose up`: every invocation names the production file and env explicitly.
+
+```bash
+cp .env.prod.example .env.prod
+cp .env.prod.gateway.example .env.prod.gateway
+chmod 600 .env.prod .env.prod.gateway
+# Fill every required password, digest, allowlist, path, namespace and Docker GID.
+
+docker compose --env-file .env.prod -f compose.prod.yml config
+docker compose --env-file .env.prod -f compose.prod.yml pull
+docker compose --env-file .env.prod -f compose.prod.yml up -d
+```
+
+Release workflow summaries print the exact immutable gateway reference. The official Postgres, Redis, Prometheus and Grafana repositories publish their manifest digests; place those `sha256:...` values in `.env.prod`. Every production `servers:` image should likewise be `repository@sha256:...` and must already exist on the host because runtime pulling is disabled.
+
+The active policy is mounted as one read-only file. On Linux, make the private key owned by UID/GID 1000 with mode `0400`, the revision directory owned by 1000:1000 with mode `0700`, and the active policy/public key read-only (`0444`). The verifier receives only the public key. `.env.prod.gateway` contains only policy-referenced `PORTUNUSMCP_UPSTREAM_*`, signing and TOTP secrets. Postgres and Redis are password-protected and reachable only on the internal data network; neither publishes a host port.
+
+The gateway binds to `127.0.0.1:${GATEWAY_PORT:-8000}`. Put an operator-managed TLS reverse proxy in front of it and set `ALLOWED_HOSTS`/`ALLOWED_ORIGINS` to the real public names. Internal gateway-to-database traffic is plaintext inside the isolated single-host Compose network.
+
+Optional production monitoring also stays loopback-only and requires a Grafana login:
+
+```bash
+docker compose --env-file .env.prod -f compose.prod.yml --profile monitoring up -d
+```
+
+Do not scale `gateway`: session/container handles are in memory and the audit chain has one safe writer. The direct Docker socket remains root-equivalent host access. Named volumes persist data but are not backups; backup/restore, TLS termination, host patching and log shipping remain operator responsibilities.
 
 ### Resource controls and readiness
 
@@ -214,7 +244,7 @@ Container initialization: first 544.45 ms; next 20 p50 442.97 ms / p95 868.89 ms
 
 ## Roadmap
 
-Phases 1–5 are complete. **Phase 6 is making the adopted gateway honestly self-hostable.** Items 39–40 now provide the upstream isolation boundary plus bounded HTTP/session/call lifecycles and dependency-aware readiness; item 41 (separating the demo stack from a safe single-replica production profile) is next.
+Phases 1–5 are complete. **Phase 6 is making the adopted gateway honestly self-hostable.** Items 39–41 provide the upstream isolation boundary, bounded HTTP/session/call lifecycles, dependency-aware readiness, and separate explicit demo/production Compose profiles. Item 42, the operator CLI/API, is next.
 
 Each item in [`ROADMAP.md`](./ROADMAP.md) states the check that proves it done and the threat-model row it upgrades — **an item is finished when that row can be honestly rewritten, not when the code merges.**
 

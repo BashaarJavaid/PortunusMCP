@@ -22,12 +22,12 @@ is printed by the script):
       UPSTREAM_RUNTIME_NAMESPACE=portunusmcp-demo \
       BUSINESS_HOURS_START_UTC=0 BUSINESS_HOURS_END_UTC=24 \
       PORTUNUSMCP_DEMO_TOTP_SECRET=<printed by the script> \
-      docker compose up -d --build
+      docker compose --env-file .env.demo -f compose.demo.yml up -d --build
 (the rogue upstream container lives in the demo policy's `servers:` block)
 then, when prompted again (the rug pull, visible on screen):
     curl -X POST localhost:9800/_admin/apply_mutation
 and for the closing simulation beat (activates the v2 draft so it gets a snapshot):
-    docker kill -s HUP portunusmcp-gateway-1
+    docker kill -s HUP portunusmcp-demo-gateway-1
 """
 
 import asyncio
@@ -244,11 +244,11 @@ async def wait_for_gateway(api_key: str, signing_secret: str, totp_secret: str) 
     print(f"      {SIGNED_SECRET_ENV_NAME}={signing_secret} \\")
     print("      BUSINESS_HOURS_START_UTC=0 BUSINESS_HOURS_END_UTC=24 \\")
     print(f"      {TOTP_SECRET_ENV_NAME}={totp_secret} \\")
-    print("      docker compose up -d --build")
+    print("      docker compose --env-file .env.demo -f compose.demo.yml up -d --build")
     print("  (the rogue upstream container is in the demo policy's servers: block)")
     print(
         "  (stack already running with the demo policy? hot-reload this run's fresh"
-        " keys with:  docker kill -s HUP portunusmcp-gateway-1)"
+        " keys with:  docker kill -s HUP portunusmcp-demo-gateway-1)"
     )
     async with httpx.AsyncClient() as client:
         for _ in range(240):
@@ -262,7 +262,7 @@ async def wait_for_gateway(api_key: str, signing_secret: str, totp_secret: str) 
             except httpx.HTTPError:
                 pass
             await asyncio.sleep(0.5)
-    sys.exit("gateway never became ready — is docker compose up?")
+    sys.exit("gateway never became ready — is compose.demo.yml up?")
 
 
 async def show_tools(identity: str, api_key: str) -> None:
@@ -430,7 +430,7 @@ async def simulate_draft_policy(keys: dict[str, str], ci_key_id: str) -> None:
     section("policy simulation — preview a tightened v2 policy against today's traffic")
     write_policy(keys, ci_key_id, version=2, developer_tools=["read_inbox"])
     print("  v2 draft written to policies/demo-policy.yaml: developer LOSES send_email.")
-    print("  In another terminal:  docker kill -s HUP portunusmcp-gateway-1")
+    print("  In another terminal:  docker kill -s HUP portunusmcp-demo-gateway-1")
     print("  (hot-reloads v2 and records the revision snapshot the simulator needs)")
     today = time.strftime("%Y-%m-%d", time.gmtime())
     async with httpx.AsyncClient() as client:

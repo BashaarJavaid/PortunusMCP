@@ -37,7 +37,7 @@ async def revisions_tmp(clean_audit: None, tmp_path: Path, monkeypatch: pytest.M
 
 
 async def test_startup_conflict_names_the_reset_command(revisions_tmp: Path) -> None:
-    # The demo's policy v1 is on record; a fresh `docker compose up` boots the
+    # The demo's policy v1 is on record; a fresh demo-stack startup boots the
     # default policy — same version, different content.
     await policy_versions.record_activation(load_bytes(DEMO_POLICY), "startup", async_session)
     with pytest.raises(

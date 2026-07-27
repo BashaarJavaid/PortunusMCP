@@ -1,3 +1,8 @@
+# DEVELOPMENT/DEMO ONLY.
+# This stack intentionally publishes Postgres, Redis, the rogue mutation service,
+# and anonymous monitoring with local default credentials. Never deploy it.
+name: portunusmcp-demo
+
 services:
   postgres:
     image: postgres:16
@@ -58,7 +63,7 @@ services:
     group_add:
       - ${DOCKER_GID:?set DOCKER_GID to the docker.sock group id}
     volumes:
-      # Host-editable policies: edit + `docker kill -s HUP portunusmcp-gateway-1` to reload.
+      # Host-editable policies: edit + `docker kill -s HUP portunusmcp-demo-gateway-1`.
       # Read-only so a compromised gateway can't persist a policy backdoor; only the
       # revisions submount is writable, for activation snapshots (item 19).
       - ./policies:/app/policies:ro
@@ -117,7 +122,7 @@ services:
     ports:
       - "9800:9800"
 
-  # Observability (§7, item 25): opt-in via `docker compose --profile monitoring up -d`.
+  # Observability (§7, item 25): opt-in with compose.demo.yml's monitoring profile.
   # Prometheus scrapes gateway:9100 / verifier:9101 over the compose network only —
   # those ports are deliberately not published (metric labels carry identity ids and
   # tool names); the §7 posture is unauthenticated-but-internal.

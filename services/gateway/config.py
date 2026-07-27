@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Defaults are local-dev only; docker-compose.yml / .env override them.
+    # Defaults are local-dev only; the explicit demo/production Compose envs override them.
     database_url: str = "postgresql+asyncpg://portunusmcp:portunusmcp@localhost:5432/portunusmcp"
     redis_url: str = "redis://localhost:6379/0"
     policy_file: str = "policies/example-policy.yaml"
@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     metrics_port: int = 9100
     # Bind address for that listener. Loopback by default so a gateway run directly
     # on a host does not expose identity ids and tool names on every interface;
-    # compose sets METRICS_HOST=0.0.0.0, where container network isolation (the port
+    # Compose sets METRICS_HOST=0.0.0.0, where container network isolation (the port
     # is deliberately not published) is the boundary instead.
     metrics_host: str = "127.0.0.1"
 

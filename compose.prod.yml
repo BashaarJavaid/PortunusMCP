@@ -1,0 +1,239 @@
+# Single-host, single-gateway-replica production profile.
+# TLS termination and backups are operator responsibilities. The Docker socket is
+# root-equivalent host access; see ADR-007 and THREAT_MODEL.md before deploying.
+name: portunusmcp-prod
+
+x-security: &security
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "5"
+
+services:
+  postgres:
+    <<: *security
+    image: postgres:16@${POSTGRES_IMAGE_DIGEST:?set POSTGRES_IMAGE_DIGEST to sha256:...}
+    user: "999:999"
+    environment:
+      POSTGRES_USER: portunusmcp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a URL-safe POSTGRES_PASSWORD}
+      POSTGRES_DB: portunusmcp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    tmpfs:
+      - /var/run/postgresql:uid=999,gid=999,mode=3775
+      - /tmp:uid=999,gid=999,mode=1777
+    networks: [data]
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    logging: *logging
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U portunusmcp -d portunusmcp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    <<: *security
+    image: redis:7@${REDIS_IMAGE_DIGEST:?set REDIS_IMAGE_DIGEST to sha256:...}
+    user: "999:999"
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set a URL-safe REDIS_PASSWORD}
+    command:
+      - sh
+      - -ec
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$$REDISCLI_AUTH"
+    volumes:
+      - redisdata:/data
+    networks: [data]
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    logging: *logging
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    <<: *security
+    image: ghcr.io/bashaarjavaid/portunusmcp@${GATEWAY_IMAGE_DIGEST:?set GATEWAY_IMAGE_DIGEST to sha256:...}
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
+    networks: [data]
+    restart: "no"
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 64
+    logging: *logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  gateway:
+    <<: *security
+    image: ghcr.io/bashaarjavaid/portunusmcp@${GATEWAY_IMAGE_DIGEST:?set GATEWAY_IMAGE_DIGEST to sha256:...}
+    scale: 1
+    env_file:
+      - ${GATEWAY_ENV_FILE:-.env.prod.gateway}
+    environment:
+      DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
+      REDIS_URL: redis://default:${REDIS_PASSWORD}@redis:6379/0
+      POLICY_FILE: /app/config/policy.yaml
+      POLICY_REVISIONS_DIR: /app/policies/revisions
+      SIGNING_KEY_FILE: /app/secrets/audit_signing_key.pem
+      MAX_MCP_BODY_BYTES: ${MAX_MCP_BODY_BYTES}
+      MAX_JSON_DEPTH: ${MAX_JSON_DEPTH}
+      MAX_SESSIONS_PER_IDENTITY: ${MAX_SESSIONS_PER_IDENTITY}
+      MAX_INFLIGHT_CALLS_PER_IDENTITY: ${MAX_INFLIGHT_CALLS_PER_IDENTITY}
+      TOOL_CALL_RATE_LIMIT: ${TOOL_CALL_RATE_LIMIT}
+      TOOL_CALL_RATE_WINDOW_SECONDS: ${TOOL_CALL_RATE_WINDOW_SECONDS}
+      TOOL_CALL_DEADLINE_SECONDS: ${TOOL_CALL_DEADLINE_SECONDS}
+      READINESS_TIMEOUT_SECONDS: ${READINESS_TIMEOUT_SECONDS}
+      SCHEMA_CACHE_TTL: ${SCHEMA_CACHE_TTL}
+      SESSION_IDLE_TTL: ${SESSION_IDLE_TTL}
+      SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS}
+      REPLAY_WINDOW_SECONDS: ${REPLAY_WINDOW_SECONDS}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      BUSINESS_HOURS_START_UTC: ${BUSINESS_HOURS_START_UTC}
+      BUSINESS_HOURS_END_UTC: ${BUSINESS_HOURS_END_UTC}
+      RISK_FREQ_WINDOW_SECONDS: ${RISK_FREQ_WINDOW_SECONDS}
+      RISK_FREQ_THRESHOLD: ${RISK_FREQ_THRESHOLD}
+      RISK_DECAY_STEP: ${RISK_DECAY_STEP}
+      RISK_DECAY_MAX: ${RISK_DECAY_MAX}
+      RISK_DECAY_TTL_SECONDS: ${RISK_DECAY_TTL_SECONDS}
+      RISK_DENIAL_WINDOW_SECONDS: ${RISK_DENIAL_WINDOW_SECONDS}
+      RISK_DENIAL_THRESHOLD: ${RISK_DENIAL_THRESHOLD}
+      RISK_AUTH_FAILURE_WINDOW_SECONDS: ${RISK_AUTH_FAILURE_WINDOW_SECONDS}
+      RISK_AUTH_FAILURE_THRESHOLD: ${RISK_AUTH_FAILURE_THRESHOLD}
+      RISK_DRIFT_HISTORY_WINDOW_SECONDS: ${RISK_DRIFT_HISTORY_WINDOW_SECONDS}
+      RISK_DRIFT_HISTORY_THRESHOLD: ${RISK_DRIFT_HISTORY_THRESHOLD}
+      DRIFT_DESCRIPTION_SEVERITY: ${DRIFT_DESCRIPTION_SEVERITY}
+      APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS}
+      STEP_UP_TTL_SECONDS: ${STEP_UP_TTL_SECONDS}
+      METRICS_HOST: 0.0.0.0
+      UPSTREAM_RUNTIME_NAMESPACE: ${UPSTREAM_RUNTIME_NAMESPACE:?set UPSTREAM_RUNTIME_NAMESPACE}
+      DOCKER_HOST: unix:///var/run/docker.sock
+    group_add:
+      - ${DOCKER_GID:?set DOCKER_GID to the docker.sock group id}
+    volumes:
+      - ${POLICY_FILE_HOST:?set POLICY_FILE_HOST}:/app/config/policy.yaml:ro
+      - ${POLICY_REVISIONS_DIR_HOST:?set POLICY_REVISIONS_DIR_HOST}:/app/policies/revisions
+      - ${AUDIT_SIGNING_PRIVATE_KEY_FILE:?set AUDIT_SIGNING_PRIVATE_KEY_FILE}:/app/secrets/audit_signing_key.pem:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    tmpfs:
+      - /tmp:uid=1000,gid=1000,mode=1777
+    ports:
+      - 127.0.0.1:${GATEWAY_PORT:-8000}:8000
+    networks: [edge, data]
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    logging: *logging
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          CMD,
+          python,
+          -c,
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  verifier:
+    <<: *security
+    image: ghcr.io/bashaarjavaid/portunusmcp@${GATEWAY_IMAGE_DIGEST:?set GATEWAY_IMAGE_DIGEST to sha256:...}
+    command: python scripts/audit_verifier_daemon.py
+    environment:
+      DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
+      SIGNING_PUBLIC_KEY_FILE: /app/secrets/audit_signing_key.pub.pem
+      VERIFY_INTERVAL_SECONDS: ${VERIFY_INTERVAL_SECONDS}
+      METRICS_PORT: "9101"
+      METRICS_HOST: 0.0.0.0
+    volumes:
+      - ${AUDIT_SIGNING_PUBLIC_KEY_FILE:?set AUDIT_SIGNING_PUBLIC_KEY_FILE}:/app/secrets/audit_signing_key.pub.pem:ro
+    tmpfs:
+      - /tmp:uid=1000,gid=1000,mode=1777
+    networks: [edge, data]
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 64
+    logging: *logging
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  prometheus:
+    <<: *security
+    image: prom/prometheus:v3.4.1@${PROMETHEUS_IMAGE_DIGEST:?set PROMETHEUS_IMAGE_DIGEST to sha256:...}
+    profiles: [monitoring]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    ports:
+      - 127.0.0.1:${PROMETHEUS_PORT:-9090}:9090
+    networks: [edge]
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    logging: *logging
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  grafana:
+    <<: *security
+    image: grafana/grafana:12.0.2@${GRAFANA_IMAGE_DIGEST:?set GRAFANA_IMAGE_DIGEST to sha256:...}
+    profiles: [monitoring]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?set GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    tmpfs:
+      - /tmp
+    ports:
+      - 127.0.0.1:${GRAFANA_PORT:-3000}:3000
+    networks: [edge]
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    logging: *logging
+    depends_on: [prometheus]
+
+networks:
+  edge:
+  data:
+    internal: true
+
+volumes:
+  pgdata:
+  redisdata:
+  prometheusdata:
+  grafanadata:

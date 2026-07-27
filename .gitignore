@@ -3,8 +3,12 @@ __pycache__/
 *.pyc
 .venv/
 .env
+.env.demo
+.env.prod
+.env.prod.gateway
 .pytest_cache/
 .coverage
+.coverage.*
 .mypy_cache/
 .ruff_cache/
 dist/

@@ -4,7 +4,7 @@ schema/risk/challenge/rate keys, and (from the CLI) the policy revision snapshot
 
 This exists because item 19's fail-closed activation checks are *supposed* to
 refuse a policy version that was already recorded with different content — which
-is exactly what leftover demo state looks like to a fresh `docker compose up`.
+is exactly what leftover demo state looks like to a fresh demo-stack startup.
 The gateway's startup error names this script; running it is the remedy. Nothing
 here weakens the checks themselves.
 
@@ -16,7 +16,8 @@ revisions dir is patched to a tmp path only *after* the reset runs.
 Run:
     python scripts/reset_dev_state.py          # confirms interactively
     python scripts/reset_dev_state.py --yes    # no prompt (scripts, docker)
-    docker compose run --rm gateway python scripts/reset_dev_state.py --yes
+    docker compose --env-file .env.demo -f compose.demo.yml run --rm gateway \
+      python scripts/reset_dev_state.py --yes
 """
 
 import asyncio
@@ -47,7 +48,10 @@ async def reset_dev_state(clear_snapshots: bool = True) -> None:
             if keys:
                 await redis_client.delete(*keys)
     except Exception as exc:
-        raise ResetError("redis not reachable — run: docker compose up -d redis") from exc
+        raise ResetError(
+            "redis not reachable — run: docker compose --env-file .env.demo"
+            " -f compose.demo.yml up -d redis"
+        ) from exc
     finally:
         await redis_client.aclose()
     try:
@@ -60,7 +64,10 @@ async def reset_dev_state(clear_snapshots: bool = True) -> None:
             await conn.execute(text("TRUNCATE approvals"))
             await conn.execute(text("TRUNCATE policy_versions"))
     except Exception as exc:
-        raise ResetError("postgres not reachable — run: docker compose up -d postgres") from exc
+        raise ResetError(
+            "postgres not reachable — run: docker compose --env-file .env.demo"
+            " -f compose.demo.yml up -d postgres"
+        ) from exc
     if clear_snapshots:
         # Leftover snapshots trip item 19's append-only check even after the
         # policy_versions truncate; the glob leaves .gitkeep alone.
@@ -80,7 +87,7 @@ def main() -> None:
         asyncio.run(reset_dev_state())
     except ResetError as exc:
         sys.exit(str(exc))
-    print("dev state reset — the gateway will start fresh on the next docker compose up")
+    print("dev state reset — the gateway will start fresh on the next demo-stack startup")
 
 
 if __name__ == "__main__":

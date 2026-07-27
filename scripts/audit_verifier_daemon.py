@@ -1,7 +1,7 @@
 """Audit verifier daemon (ARCHITECTURE.md §4.8, ROADMAP item 11): incremental
 chain + signature verification on a schedule, resuming from last_verified_seq.
 
-Runs as a sidecar container (see docker-compose.yml) or under cron with a single
+Runs as a sidecar container (see the Compose files) or under cron with a single
 pass via --once. Needs only the PUBLIC key — the private key stays with the gateway.
 
 Usage:

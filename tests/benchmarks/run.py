@@ -14,7 +14,7 @@ Documented choices (the §9 method leaves these open):
   the interceptor's transparent upstream tools/list re-fetch + drift check per call.
 
 Run (postgres + redis must be reachable; wipes the dev audit chain like the tests do):
-    docker compose up -d postgres redis
+    docker compose --env-file .env.demo -f compose.demo.yml up -d postgres redis
     docker build -t portunusmcp:dev .
     export UPSTREAM_RUNTIME_NAMESPACE=portunusmcp-benchmark
     .venv/bin/python -m tests.benchmarks.run [N]   # N = calls per scenario, default 1000

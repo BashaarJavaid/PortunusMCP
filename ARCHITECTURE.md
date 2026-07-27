@@ -162,16 +162,16 @@ Edges elided for readability: Auth bumps the gateway-wide auth-failure counter i
 
 ### 4.5 Deployment diagrams
 
-**(a) MVP — Docker Compose (what this repo runs today).** The gateway mounts the local Unix Docker socket and launches one sibling upstream container per session from the typed policy registry. The `rogue` service exists only to host the demo's mutation endpoint and reset/status surface; the actual rogue MCP server runs in the same isolated per-session container model.
+**(a) Explicit demo profile (`compose.demo.yml`).** This intentionally unsafe local stack publishes Postgres, Redis, the rogue mutation endpoint, and optional anonymous monitoring. It uses default development credentials and tag-pinned images. The fixed `portunusmcp-demo` project name and explicit file/env arguments prevent it from being mistaken for the production profile. The actual rogue MCP server still runs through the same isolated per-session container model; the `rogue` service only hosts its demo mutation/status surface.
 
 ```mermaid
 graph TD
     C["MCP client (host)"] -->|"Streamable HTTP :8000"| G
 
-    subgraph Compose["Docker Compose, single host"]
+    subgraph Demo["portunusmcp-demo (unsafe local profile)"]
         G["gateway container (FastAPI + Docker CLI)"]
-        PG[("postgres:16  :5432")]
-        R[("redis:7  :6379")]
+        PG[("postgres :5432 published")]
+        R[("redis :6379 published")]
         V["verifier sidecar (audit_verifier_daemon, read-only)"]
         RG["rogue admin service :9800 (demo only)"]
     end
@@ -185,29 +185,27 @@ graph TD
     RG -.->|"namespaced named volume"| U
 ```
 
-Volume posture, security-relevant: `./policies` is mounted **read-only** into the gateway, with only `./policies/revisions` writable for activation snapshots; `./secrets` is read-only in the gateway, while the verifier mounts only the public-key file. Upstream named volumes must start with `portunusmcp-upstream-<namespace>-`, are mounted read-only, and cannot target `/app/secrets`, `/var/run/docker.sock`, or descendants.
-
-The gateway's Docker socket is intentionally **root-equivalent access to the host**. It creates the boundary between upstreams and gateway secrets, but means a shell compromise of the gateway is a host compromise. `DOCKER_GID` grants the gateway process socket access explicitly; this is an operator trust decision, not a sandbox.
-
-**(b) Production target (Phase 4, not built).**
+**(b) Supported production profile (`compose.prod.yml`).** Production is one hardened gateway replica on one Docker host. The gateway is loopback-published for an operator-managed TLS reverse proxy. Postgres and password-protected, AOF-backed Redis have no host ports and live on an internal data network. A one-shot migration container must complete before gateway/verifier startup. Optional Prometheus/Grafana use the edge/metrics network, loopback-only UIs, persistent data, and required Grafana login. All service images are digest-pinned; every policy-registered production upstream should be too.
 
 ```mermaid
 graph TD
-    LB[Load Balancer / ALB] --> G1[Gateway replica 1]
-    LB --> G2[Gateway replica 2]
-    LB --> G3[Gateway replica 3]
-    G1 --> RedisC[(Redis - shared, ElastiCache)]
-    G2 --> RedisC
-    G3 --> RedisC
-    G1 --> PG[(Postgres - shared, RDS)]
-    G2 --> PG
-    G3 --> PG
-    G1 --> Servers[Upstream MCP Servers - network transport]
-    G2 --> Servers
-    G3 --> Servers
+    TLS["Operator TLS reverse proxy"] -->|"loopback :8000"| G["gateway (scale: 1)"]
+    G -->|"internal data network"| PG[("Postgres")]
+    G -->|"internal data network"| R[("Redis + AOF")]
+    M["one-shot Alembic migration"] --> PG
+    V["verifier"] --> PG
+    P["optional Prometheus"] --> G
+    P --> V
+    GF["optional Grafana + login"] --> P
+    G -->|"Unix Docker socket"| D["local Docker daemon"]
+    D --> U["hardened upstream container per session"]
 ```
 
-This network-upstream diagram remains a future target, not the current deployment. Today's Session Manager and container handles are in memory, and the audit chain is single-writer, so the supported local-container deployment is one gateway replica. Remote Streamable-HTTP upstreams and true multi-replica operation remain explicitly deferred.
+Every production service has a read-only root, dropped capabilities, no-new-privileges, memory/CPU/PID limits, bounded Docker JSON logs, and only its required writable volumes/tmpfs. The gateway receives one active policy file, one writable revision directory, the private audit key, and the Docker socket; the verifier receives only the public key. Production gateway-only policy secrets live in a separate env file rather than exposing Compose/Grafana credentials to the gateway.
+
+The gateway's Docker socket is intentionally **root-equivalent access to the host**. It creates the boundary between upstreams and gateway secrets, but means a shell compromise of the gateway is a host compromise. `DOCKER_GID` grants socket access explicitly; this is an operator trust decision, not a sandbox.
+
+The single-replica constraint is correctness, not sizing advice: Session Manager/container handles are in memory, and item 23 experimentally proved two audit-writer instances can fork the chain. Remote Streamable-HTTP upstreams, a distributed atomic audit writer, and true multi-replica operation remain explicitly deferred. Terraform/ECS is likewise deferred; `compose.prod.yml` is its compose-level prerequisite, not a substitute claim that cloud infrastructure exists.
 
 ### 4.6 Data flow diagram (single request, all stages)
 
@@ -509,9 +507,10 @@ The consistent theme: every subsystem whose failure would silently weaken a secu
 
 - **Implemented (item 39):** each upstream runs in a dedicated container as UID 65532 with a read-only root, restricted tmpfs, no new privileges, all capabilities dropped, bounded memory/CPU/PIDs, no swap above memory, a minimal allowlisted environment, and no network unless `bridge` is explicit.
 - **Implemented (item 40):** strict body/depth bounds, SDK Host/Origin validation, per-identity session/in-flight quotas, a 60-second call deadline, and a Redis fixed-window `tools/call` limit (default 60 per 60 seconds). The fixed window is deliberately simple and permits up to twice the configured count across two adjacent window boundaries; replace it only if measured abuse requires a sliding window.
+- **Implemented (item 41):** the production Compose profile is explicit and single-replica, publishes only loopback app/monitoring ports, isolates authenticated Postgres/Redis on an internal network, digest-pins service images, separates gateway-only secrets, and applies read-only roots, dropped capabilities, no-new-privileges, resource ceilings, restart policies, and bounded local logs.
 - Never log full argument payloads for tools flagged as handling secrets (policy field: `redact_args: true` per tool).
 - API keys stored only as salted hashes; raw keys shown once at creation time via admin CLI, never persisted in plaintext.
-- All inter-service traffic (gateway → Postgres, gateway → Redis) over TLS in production; local dev can use plaintext within the Docker network only.
+- The shipped single-host production profile trusts plaintext traffic inside its isolated backend network; a future multi-host deployment must add authenticated TLS between services.
 - Dependency pinning + Dependabot/Renovate for the Python side; run `pip-audit` in CI.
 - Structured logs never include the API key header value, even in DEBUG mode — implement a logging filter that redacts it.
 
@@ -525,8 +524,8 @@ The consistent theme: every subsystem whose failure would silently weaken a secu
 *Implemented (item 25). Structured logs shipped from day one (item 13); Prometheus/Grafana were added once core gateway logic was stable so effort wasn't split across two problems at once.*
 
 - **Prometheus metrics** (`services/gateway/metrics.py` — exactly this set, no more): `portunusmcp_tool_calls_total{identity, server, tool, decision}` (incremented at the interceptor's three terminal emission points; `decision` = the audit event type; `tool` preserves a name only when it exists in that server's current Redis schema cache, otherwise `other`, including on cache failure), `portunusmcp_schema_drift_total{server, tool, severity}` (Drift Detector classification writes), `portunusmcp_risk_score` (histogram, observed once per freshly scored call whatever the eventual outcome), `portunusmcp_request_latency_seconds` (histogram, decision-pipeline time per `tools/call` — proxy overhead only, the upstream round trip is excluded), `portunusmcp_audit_chain_verify_failures_total` (verifier failure branch — alert on any increase; this replaced item 11/13's `logger.error`-only alerting), `portunusmcp_replay_denied_total`.
-- **Exposure posture:** unauthenticated but internal-only. Metric labels carry identity ids and tool names, so `/metrics` is never served on the published app port — the gateway starts a separate listener on `METRICS_PORT` (default 9100; the verifier sidecar uses 9101, skipped under `--once`), and docker-compose deliberately does not publish either port. Prometheus scrapes them over the compose network. Metric increments are in-memory and cannot meaningfully fail — no fail-open/fail-closed posture applies.
-- **Prometheus + Grafana containers:** opt-in via `docker compose --profile monitoring up -d` (config in `monitoring/`; Prometheus UI on 9090, Grafana on 3000 with anonymous access for local dev). The default compose stack is unchanged.
+- **Exposure posture:** unauthenticated but internal-only. Metric labels carry identity ids and tool names, so `/metrics` is never served on the published app port — the gateway starts a separate listener on `METRICS_PORT` (default 9100; the verifier sidecar uses 9101, skipped under `--once`), and neither Compose file publishes those ports. Prometheus scrapes them over the Compose network. Metric increments are in-memory and cannot meaningfully fail — no fail-open/fail-closed posture applies.
+- **Prometheus + Grafana containers:** both explicit Compose files have an opt-in `monitoring` profile. Demo publishes anonymous local Grafana; production binds both UIs to loopback, requires a Grafana login, persists their state, and applies the production hardening/limits.
 - **Grafana dashboard** (`monitoring/grafana/dashboards/portunusmcp.json`, provisioned automatically): panels for allow/deny/challenge rate over time, top denied tools, drift events timeline by severity, risk score distribution, p50/p95/p99 pipeline latency.
 - **Structured logs (structlog, JSON):** one line per decision, correlation ID = session ID, shippable to any log aggregator. Shipped in MVP regardless of the Prometheus/Grafana timeline.
 
@@ -605,6 +604,7 @@ None of this is built or load-tested at those scales for v1 — it's written her
 
 - **Unit:** policy resolution logic (RBAC + ABAC condition evaluation), schema hashing and diff classification, risk scoring function, param validator edge cases (nested objects, arrays, unicode).
 - **Integration:** spin up the gateway + a real (mock) MCP server in Compose, drive full `initialize → tools/list → tools/call` sequences via the actual MCP client SDK.
+- **Production Compose:** render the digest-only production contract, then use local-image test overrides to boot its core + monitoring services, assert isolation/hardening, and drive `initialize → tools/list → tools/call` through the real per-session container runtime.
 - **Resource/lifecycle:** `tests/integration/test_resource_limits.py` uses a tiny async sleep tool to cover declared and streamed body limits, JSON depth/encoding/model validation, SDK Host/Origin checks, session/in-flight/rate boundaries and failure semantics, deadline reaping, and in-flight idle heartbeats. `tests/unit/test_readiness.py` covers named dependency/signing failures and the one overall readiness deadline; metrics tests prove arbitrary denied names collapse to `tool="other"`.
 - **Adversarial suite (this is your differentiator in interviews):**
   - Simulate a rug pull at each severity tier: description-only change (should not block), required-field change (should block), tool rename (should block as new/unapproved) — assert correct classification and correct action per tier.
@@ -633,7 +633,7 @@ jobs:
   test:       pytest --cov=services --cov-fail-under=80
   benchmark:  runs on merge to main only, uploads latency report artifact
   build:      docker build (multi-stage, non-root final image)
-  push:       on tag → push to GHCR/ECR
+  push:       on tag → push to GHCR and publish the immutable digest in the job summary
 ```
 
 ---
@@ -643,8 +643,8 @@ jobs:
 
 ## 13. Deployment
 
-- **MVP (Phase 1-2):** `docker-compose.yml` with gateway, Postgres, Redis, and the two `sample_target` demo servers — one command to get the full demo running. This is the only deployment target until the gateway logic itself is done and tested; infra work is explicitly sequenced *after*, not in parallel, so effort isn't split.
-- **Post-MVP (Phase 3+):** Terraform provisions VPC, RDS Postgres (encrypted at rest), ElastiCache Redis, an ECS Fargate service behind an ALB with TLS termination, secrets pulled from AWS Secrets Manager at container start — never baked into the image. Kubernetes/EKS is deliberately **not** built for v1 (see ADR-005) — Compose + ECS demonstrates the same infra literacy without the operational overhead of a K8s cluster for a single-service proxy.
-- **Distributed gateway note (documented, not built):** a production deployment of this pattern would run multiple stateless gateway replicas behind a load balancer, all reading from a shared Postgres policy/audit store and a shared Redis for replay-nonce and rate-limit state — the gateway holds no local state that isn't already externalized, so horizontal scaling is architecturally straightforward even though this repo only runs a single instance. This is covered as a diagram in `ARCHITECTURE.md`, not implemented, since a solo portfolio project gains little from actually standing up multi-node coordination.
+- **Demo:** `compose.demo.yml` is explicitly unsafe and local-only: default credentials, published data ports, rogue mutation service, tag-pinned images, and optional anonymous monitoring.
+- **Production:** `compose.prod.yml` is the one supported self-hosted deployment: a hardened single-replica gateway/verifier plus local Postgres/Redis, one-shot migrations, digest-pinned images, narrow secret/file mounts, internal data networking, and optional secured monitoring. TLS termination, backups, host hardening, and log shipping are operator responsibilities.
+- **Not built:** Terraform/ECS, remote network upstreams, inter-service mTLS, and multi-replica gateway coordination. Multiple replicas are unsafe until session/container ownership is externalized and the audit chain has a distributed atomic writer. Kubernetes remains deliberately out of v1 (ADR-005).
 
 ---
