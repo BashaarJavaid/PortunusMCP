@@ -202,7 +202,11 @@ docker compose --env-file .env.prod -f compose.prod.yml pull
 docker compose --env-file .env.prod -f compose.prod.yml up -d
 ```
 
-Release workflow summaries print the exact immutable gateway reference. The official Postgres, Redis, Prometheus and Grafana repositories publish their manifest digests; place those `sha256:...` values in `.env.prod`. Every production `servers:` image should likewise be `repository@sha256:...` and must already exist on the host because runtime pulling is disabled.
+The tagged production bundle fills every service image with the exact manifest digest
+tested by the release workflow; the source-tree env example keeps placeholders for
+development between releases. Every production `servers:` image should likewise be
+`repository@sha256:...` and must already exist on the host because runtime pulling is
+disabled.
 
 Production now mounts two operator-owned, writable roots into the gateway:
 
@@ -251,6 +255,8 @@ A missing `Origin` remains valid for non-browser MCP clients. Any supplied Origi
 The package installs `portunusmcp`, a stdlib-only operator client for the authenticated `/admin` API. Put the admin credential only in the environment; it is never accepted as a command-line argument:
 
 ```bash
+pipx install portunusmcp==0.1.0
+
 export PORTUNUSMCP_URL=https://gateway.example.com
 export PORTUNUSMCP_ADMIN_KEY='shown-once-admin-key'
 
@@ -314,6 +320,9 @@ Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md) — decision pipeline, every component in depth, failure modes, observability, benchmarks, scalability, testing, deployment
 - [`THREAT_MODEL.md`](./THREAT_MODEL.md) — what's protected, what isn't, and the assumptions underneath
 - [`SECURITY.md`](./SECURITY.md) — vulnerability disclosure
+- [`COMPATIBILITY.md`](./COMPATIBILITY.md) — supported runtimes, images, clients, and tested platforms
+- [`UPGRADING.md`](./UPGRADING.md) — supported upgrade and rollback procedure
+- [`CHANGELOG.md`](./CHANGELOG.md) — release history
 - [`docs/adr/`](./docs/adr/) — one file per consequential decision, including why Envoy, OPA, Kong, NGINX, sidecars, and client-SDK middleware were each rejected for v1
 - [`ROADMAP.md`](./ROADMAP.md) — the build order as a living checklist
 

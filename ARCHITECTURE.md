@@ -651,7 +651,8 @@ jobs:
   test:       pytest --cov=services --cov-fail-under=80
   benchmark:  runs on merge to main only, uploads latency report artifact
   build:      docker build (multi-stage, non-root final image)
-  push:       on tag → push to GHCR and publish the immutable digest in the job summary
+  release:    signed tag on main → multi-arch GHCR image + exact Compose bundle
+              → fresh-host and persisted-state smoke → PyPI + latest + GitHub Release
 ```
 
 ---
