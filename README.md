@@ -25,7 +25,47 @@ PortunusMCP sits between the two and closes those three.
 
 ### Client compatibility
 
-**Neither side needs changes.** The upstream server is proxied as-is, and a stock Claude Desktop, Cursor, or SDK `ClientSession` works unmodified under the default `bearer` auth mode — RBAC, ABAC, drift blocking, risk scoring, parameter validation, and the signed audit trail are all fully enforced on every call (the integration suite runs an unpatched SDK client end to end). Auth posture is per-identity ([`ROADMAP.md`](./ROADMAP.md) item 34): identities that can adopt a small signing client opt into `signed` mode, where the request carries a non-secret key id plus an HMAC over the call — no credential on the wire at all, which is what makes replay protection real (a captured request cannot be re-signed with a fresh nonce). The tradeoff is honest: `bearer` = zero client changes, key rides the request; `signed` = custom client, capture-proof.
+The upstream server is proxied unchanged. The default `bearer` mode works without client source changes when the client can attach `X-PortunusMCP-Key` to a remote MCP connection.
+
+| Client | Result | Evidence |
+|---|---|---|
+| [Claude Desktop](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp) 1.20186.0 | **Incompatible with bearer** | The remote custom connector could not attach the header; it received 401, then attempted OAuth discovery and dynamic client registration. |
+| [Cursor](https://docs.cursor.com/context/model-context-protocol) 3.13.10 | **Compatible** | The user-level configuration below connected and `tools/list` served `send_email` and `read_inbox` while pruning `delete_mailbox`; the signed audit row recorded the same set. |
+| Python MCP SDK 1.28.1 `ClientSession` | **Compatible** | The stock streamable-HTTP client produced the same pruned `tools/list`; the integration suite exercises this path end to end. |
+
+These are point-in-time results from 2026-07-27 on macOS 15.7.3 arm64. Cursor's tested user-level `~/.cursor/mcp.json` entry was:
+
+```json
+{
+  "mcpServers": {
+    "portunusmcp": {
+      "url": "https://gateway.example.com/mcp/default",
+      "headers": {
+        "X-PortunusMCP-Key": "${env:PORTUNUSMCP_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+Launch Cursor with `PORTUNUSMCP_API_KEY` available in its environment; do not put the raw key in a committed file. The equivalent SDK connection is:
+
+```python
+import os
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+headers = {"X-PortunusMCP-Key": os.environ["PORTUNUSMCP_API_KEY"]}
+async with streamable_http_client(
+    "https://gateway.example.com/mcp/default", headers=headers
+) as (read, write, _):
+    async with ClientSession(read, write) as session:
+        await session.initialize()
+        tools = await session.list_tools()
+```
+
+Auth posture is per-identity ([`ROADMAP.md`](./ROADMAP.md) item 34): identities that can adopt a small signing client opt into `signed` mode, where the request carries a non-secret key id plus an HMAC over the call — no credential on the wire at all, which is what makes replay protection real (a captured request cannot be re-signed with a fresh nonce). The tradeoff is honest: `bearer` = stock client plus header configuration, key rides the request; `signed` = custom client, capture-proof.
 
 ---
 
@@ -162,7 +202,11 @@ docker compose --env-file .env.prod -f compose.prod.yml pull
 docker compose --env-file .env.prod -f compose.prod.yml up -d
 ```
 
-Release workflow summaries print the exact immutable gateway reference. The official Postgres, Redis, Prometheus and Grafana repositories publish their manifest digests; place those `sha256:...` values in `.env.prod`. Every production `servers:` image should likewise be `repository@sha256:...` and must already exist on the host because runtime pulling is disabled.
+The tagged production bundle fills every service image with the exact manifest digest
+tested by the release workflow; the source-tree env example keeps placeholders for
+development between releases. Every production `servers:` image should likewise be
+`repository@sha256:...` and must already exist on the host because runtime pulling is
+disabled.
 
 Production now mounts two operator-owned, writable roots into the gateway:
 
@@ -211,6 +255,8 @@ A missing `Origin` remains valid for non-browser MCP clients. Any supplied Origi
 The package installs `portunusmcp`, a stdlib-only operator client for the authenticated `/admin` API. Put the admin credential only in the environment; it is never accepted as a command-line argument:
 
 ```bash
+pipx install portunusmcp==0.1.0
+
 export PORTUNUSMCP_URL=https://gateway.example.com
 export PORTUNUSMCP_ADMIN_KEY='shown-once-admin-key'
 
@@ -274,6 +320,9 @@ Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md) — decision pipeline, every component in depth, failure modes, observability, benchmarks, scalability, testing, deployment
 - [`THREAT_MODEL.md`](./THREAT_MODEL.md) — what's protected, what isn't, and the assumptions underneath
 - [`SECURITY.md`](./SECURITY.md) — vulnerability disclosure
+- [`COMPATIBILITY.md`](./COMPATIBILITY.md) — supported runtimes, images, clients, and tested platforms
+- [`UPGRADING.md`](./UPGRADING.md) — supported upgrade and rollback procedure
+- [`CHANGELOG.md`](./CHANGELOG.md) — release history
 - [`docs/adr/`](./docs/adr/) — one file per consequential decision, including why Envoy, OPA, Kong, NGINX, sidecars, and client-SDK middleware were each rejected for v1
 - [`ROADMAP.md`](./ROADMAP.md) — the build order as a living checklist
 

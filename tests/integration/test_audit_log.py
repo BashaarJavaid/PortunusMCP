@@ -3,6 +3,7 @@ the basic verifier validates the chain, tampering is caught, concurrent writes d
 collide, and an unrecordable action is denied (§5)."""
 
 import asyncio
+import logging
 import os
 import subprocess
 import sys
@@ -13,10 +14,12 @@ import pytest
 import redis.asyncio as aioredis
 from cryptography.hazmat.primitives.asymmetric import ec
 from mcp import McpError
+from redis.asyncio.client import Pipeline
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import select, text
 
 from services.gateway import signing
-from services.gateway.audit_log import GENESIS_HASH, AuditWriter
+from services.gateway.audit_log import GENESIS_HASH, POINTER_KEY, AuditWriter
 from services.gateway.config import settings
 from services.gateway.db import AuditLog, async_session
 from services.gateway.decision import EventType
@@ -48,6 +51,20 @@ def run_verifier() -> "subprocess.CompletedProcess[str]":
         text=True,
         env=env,
     )
+
+
+def fail_next_pipeline_execute(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_execute = Pipeline.execute
+    failed = False
+
+    async def fail_once(self: Pipeline, *args: Any, **kwargs: Any) -> Any:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RedisConnectionError("pointer write failed")
+        return await original_execute(self, *args, **kwargs)
+
+    monkeypatch.setattr(Pipeline, "execute", fail_once)
 
 
 async def test_decision_points_write_chained_rows(gateway: Gateway) -> None:
@@ -107,6 +124,71 @@ async def test_verifier_passes_then_catches_tampering(gateway: Gateway) -> None:
     result = await asyncio.to_thread(run_verifier)
     assert result.returncode == 1
     assert "TAMPERED" in result.stdout
+
+
+async def test_pointer_write_failure_recovers_from_postgres(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer: AuditWriter = app.state.audit_writer
+    before = (await fetch_rows())[-1]
+    fail_next_pipeline_execute(monkeypatch)
+
+    with pytest.raises(RedisConnectionError, match="pointer write failed"):
+        await writer.write(EventType.ALLOW, "pointer-test", tool_name="echo")
+
+    failed_row = (await fetch_rows())[-1]
+    assert failed_row.prev_hash == before.curr_hash
+    assert await app.state.redis.get(POINTER_KEY) is None
+
+    recovered_seq = await writer.write(EventType.ALLOW, "pointer-test", tool_name="echo")
+    recovered_row = (await fetch_rows())[-1]
+    assert recovered_row.seq == recovered_seq
+    assert recovered_row.prev_hash == failed_row.curr_hash
+    assert await app.state.redis.get(POINTER_KEY) == recovered_row.curr_hash.encode()
+
+    result = await asyncio.to_thread(run_verifier)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+async def test_pointer_delete_failure_recovers_after_restart(
+    gateway: Gateway,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    writer: AuditWriter = app.state.audit_writer
+    before = (await fetch_rows())[-1]
+    fail_next_pipeline_execute(monkeypatch)
+    original_delete = app.state.redis.delete
+
+    async def fail_delete(*args: Any, **kwargs: Any) -> None:
+        raise RedisConnectionError("pointer delete failed")
+
+    monkeypatch.setattr(app.state.redis, "delete", fail_delete)
+    with caplog.at_level(logging.ERROR, logger="services.gateway.audit_log"):
+        with pytest.raises(RedisConnectionError, match="pointer write failed"):
+            await writer.write(EventType.ALLOW, "pointer-test", tool_name="echo")
+    monkeypatch.setattr(app.state.redis, "delete", original_delete)
+
+    failed_row = (await fetch_rows())[-1]
+    assert failed_row.prev_hash == before.curr_hash
+    assert await app.state.redis.get(POINTER_KEY) == before.curr_hash.encode()
+    assert "audit_pointer_invalidation_failed" in caplog.text
+
+    restarted = AuditWriter(
+        app.state.redis,
+        async_session,
+        app.state.policy_store,
+        app.state.signing_key,
+        writer.key_id,
+    )
+    recovered_seq = await restarted.write(EventType.ALLOW, "pointer-test", tool_name="echo")
+    recovered_row = (await fetch_rows())[-1]
+    assert recovered_row.seq == recovered_seq
+    assert recovered_row.prev_hash == failed_row.curr_hash
+    assert await app.state.redis.get(POINTER_KEY) == recovered_row.curr_hash.encode()
+
+    result = await asyncio.to_thread(run_verifier)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 async def test_concurrent_audit_writes_do_not_collide(clean_audit: None) -> None:

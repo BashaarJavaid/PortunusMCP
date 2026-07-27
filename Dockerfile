@@ -3,7 +3,7 @@ FROM docker:29.6.1-cli AS docker_cli
 FROM python:3.12-slim AS builder
 
 WORKDIR /build
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 COPY services ./services
 RUN pip install --no-cache-dir .
 

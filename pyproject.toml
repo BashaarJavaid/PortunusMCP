@@ -2,8 +2,20 @@
 name = "portunusmcp"
 version = "0.1.0"
 description = "Zero-trust, risk-aware gateway proxy for the Model Context Protocol"
-requires-python = ">=3.12"
-license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+authors = [{ name = "Bashaar Javaid" }]
+keywords = ["mcp", "security", "gateway", "zero-trust", "audit"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
 dependencies = [
     "fastapi==0.115.6",
     "jsonschema==4.26.0",
@@ -20,6 +32,12 @@ dependencies = [
     "pyyaml==6.0.2",
     "structlog==26.1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/BashaarJavaid/PortunusMCP"
+Repository = "https://github.com/BashaarJavaid/PortunusMCP"
+Changelog = "https://github.com/BashaarJavaid/PortunusMCP/blob/main/CHANGELOG.md"
+Issues = "https://github.com/BashaarJavaid/PortunusMCP/issues"
 
 [project.scripts]
 portunusmcp = "services.cli:main"

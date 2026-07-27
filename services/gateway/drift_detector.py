@@ -66,6 +66,70 @@ def shape_hash(tool: dict[str, Any]) -> str:
     return tool_hash({k: strip(v) for k, v in tool.items() if k != "name"})
 
 
+def _classify_schema(old: Any, new: Any) -> DriftSeverity | None:
+    """Apply the §4.8 rules at one schema node and below it."""
+    if old == new:
+        return None
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return DriftSeverity.HIGH
+
+    severities: list[DriftSeverity] = []
+    if old.get("type") != new.get("type"):
+        severities.append(DriftSeverity.CRITICAL)
+    if old.get("description") != new.get("description"):
+        severities.append(DriftSeverity.LOW)
+
+    old_props = old.get("properties") or {}
+    new_props = new.get("properties") or {}
+    old_required_value = old.get("required") or []
+    new_required_value = new.get("required") or []
+    if isinstance(old_required_value, list) and isinstance(new_required_value, list):
+        old_required = set(old_required_value)
+        new_required = set(new_required_value)
+    else:
+        old_required = new_required = set()
+        if old_required_value != new_required_value:
+            severities.append(DriftSeverity.HIGH)
+
+    if isinstance(old_props, dict) and isinstance(new_props, dict):
+        added = new_props.keys() - old_props.keys()
+        removed = old_props.keys() - new_props.keys()
+        shared = old_props.keys() & new_props.keys()
+        for prop in added:
+            severities.append(
+                DriftSeverity.CRITICAL if prop in new_required else DriftSeverity.MEDIUM
+            )
+        if removed:
+            severities.append(DriftSeverity.HIGH)
+        if (old_required ^ new_required) & shared:
+            severities.append(DriftSeverity.CRITICAL)
+        if (old_required ^ new_required) - (added | removed | shared):
+            severities.append(DriftSeverity.HIGH)
+        # ponytail: recursive walk; use an explicit stack if valid upstream schemas
+        # approach Python's recursion limit. RecursionError already fails tools/list closed.
+        for prop in shared:
+            if severity := _classify_schema(old_props[prop], new_props[prop]):
+                severities.append(severity)
+    elif old_props != new_props:
+        severities.append(DriftSeverity.HIGH)
+
+    old_items = old.get("items")
+    new_items = new.get("items")
+    if isinstance(old_items, dict) and isinstance(new_items, dict):
+        if severity := _classify_schema(old_items, new_items):
+            severities.append(severity)
+    elif old_items != new_items:
+        severities.append(DriftSeverity.HIGH)
+
+    handled = {"type", "description", "properties", "required", "items"}
+    if {key: value for key, value in old.items() if key not in handled} != {
+        key: value for key, value in new.items() if key not in handled
+    }:
+        severities.append(DriftSeverity.HIGH)
+
+    return max(severities) if severities else None
+
+
 def classify(old: dict[str, Any], new: dict[str, Any]) -> DriftSeverity | None:
     """Severity of the change between two tool definitions (§4.8 table); None if
     identical. Multiple changes report the maximum severity."""
@@ -75,25 +139,14 @@ def classify(old: dict[str, Any], new: dict[str, Any]) -> DriftSeverity | None:
         # approval is the rug pull, so it blocks by default (config.py).
         severities.append(DriftSeverity[settings.drift_description_severity.upper()])
 
-    old_schema = old.get("inputSchema") or {}
-    new_schema = new.get("inputSchema") or {}
-    old_props: dict[str, Any] = old_schema.get("properties") or {}
-    new_props: dict[str, Any] = new_schema.get("properties") or {}
-    old_required = set(old_schema.get("required") or [])
-    new_required = set(new_schema.get("required") or [])
+    if severity := _classify_schema(old.get("inputSchema") or {}, new.get("inputSchema") or {}):
+        severities.append(severity)
 
-    for prop in new_props.keys() - old_props.keys():
-        # A new *required* parameter changes what a valid call even looks like.
-        severities.append(DriftSeverity.CRITICAL if prop in new_required else DriftSeverity.MEDIUM)
-    if old_props.keys() - new_props.keys():
+    handled = {"description", "inputSchema"}
+    if {key: value for key, value in old.items() if key not in handled} != {
+        key: value for key, value in new.items() if key not in handled
+    }:
         severities.append(DriftSeverity.HIGH)
-    for prop in old_props.keys() & new_props.keys():
-        if old_props[prop].get("type") != new_props[prop].get("type"):
-            severities.append(DriftSeverity.CRITICAL)
-        elif old_props[prop] != new_props[prop]:
-            severities.append(DriftSeverity.LOW)
-    if (old_required ^ new_required) & (old_props.keys() & new_props.keys()):
-        severities.append(DriftSeverity.CRITICAL)  # required status flipped
 
     if severities:
         return max(severities)
@@ -204,9 +257,9 @@ class DriftDetector:
                         if not row.suspicious:
                             row.flagged_at = None
                     continue
-                if live_hash == row.observed_hash:
-                    continue  # this exact drift is already logged
                 severity = classify(row.approved_schema, tool) or DriftSeverity.HIGH
+                if live_hash == row.observed_hash and (row.blocked or not severity.blocks):
+                    continue
                 await self._writer.write(
                     severity.event,
                     identity_id,

@@ -3,14 +3,18 @@ classification AND the action — description-only blocks by default (item 36a, 
 knob loosens it back to log-only), required-change blocks, a rename is treated as a
 new unapproved tool. Plus the re-approval flow."""
 
+from copy import deepcopy
+
 import httpx
 import pytest
 from mcp import McpError
 from mcp.types import TextContent
 from sqlalchemy import select
 
+from services.gateway import drift_detector as drift_detector_module
 from services.gateway.config import settings
 from services.gateway.db import AuditLog, async_session
+from services.gateway.main import app
 from tests.adversarial.conftest import Gateway, set_mutation
 from tests.integration.test_policy_scoping import connect
 
@@ -84,6 +88,59 @@ async def test_required_change_is_critical_and_blocks(drift_gateway: Gateway) ->
             await session.call_tool("send_email", {"to": "a@b.c", "subject": "hi"})
         assert excinfo.value.error.data["event_type"] == "DENY_DRIFT"
     assert await drift_events() == ["DRIFT_CRITICAL"]
+
+
+@pytest.mark.parametrize("mutation", ["nested_type", "nested_required"])
+async def test_nested_critical_drift_blocks(
+    drift_gateway: Gateway,
+    mutation: str,
+) -> None:
+    await baseline(drift_gateway)
+    set_mutation(mutation)
+    async with connect(drift_gateway.url, drift_gateway.keys["dev"]) as session:
+        await session.list_tools()
+        with pytest.raises(McpError) as excinfo:
+            await session.call_tool("send_email", {"to": "a@b.c", "subject": "hi"})
+        assert excinfo.value.error.data["event_type"] == "DENY_DRIFT"
+    assert await drift_events() == ["DRIFT_CRITICAL"]
+
+
+async def test_existing_nonblocking_observation_is_reclassified_once(
+    drift_gateway: Gateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector = app.state.drift_detector
+    approved = {
+        "name": "search",
+        "description": "Search.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "object",
+                    "properties": {"mode": {"type": "string"}},
+                    "required": ["mode"],
+                }
+            },
+        },
+    }
+    observed = deepcopy(approved)
+    observed["inputSchema"]["properties"]["filter"]["properties"]["mode"]["type"] = "integer"
+
+    await detector.check("legacy", [approved], "dev")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            drift_detector_module,
+            "classify",
+            lambda old, new: drift_detector_module.DriftSeverity.LOW,
+        )
+        await detector.check("legacy", [observed], "dev")
+    assert not await detector.is_blocked("legacy", "search")
+
+    await detector.check("legacy", [observed], "dev")
+    assert await detector.is_blocked("legacy", "search")
+    await detector.check("legacy", [observed], "dev")
+    assert await drift_events() == ["DRIFT_LOW", "DRIFT_CRITICAL"]
 
 
 async def test_param_removed_is_high_and_blocks(drift_gateway: Gateway) -> None:

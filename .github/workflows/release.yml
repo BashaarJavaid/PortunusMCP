@@ -1,5 +1,5 @@
-# On a v* tag: build the (multi-stage, non-root) image and push it to GHCR,
-# tagged with the tag's semver plus latest. ECR stays a post-MVP option (§12).
+# v0.1.0 release channel: immutable multi-arch image, Python package, exact
+# production bundle, published-artifact smoke, then PyPI/latest/GitHub Release.
 
 name: release
 
@@ -8,34 +8,383 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/bashaarjavaid/portunusmcp
+  COMPOSE_VERSION: v5.3.1
+
 jobs:
-  push-image:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+      commit: ${{ steps.verify.outputs.commit }}
+      alembic_head: ${{ steps.package.outputs.alembic_head }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify tag and versions
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
+          tag_object="$(git rev-parse "$GITHUB_REF_NAME^{tag}")"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq '.verification.verified')" = "true"
+          commit="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          git fetch origin main
+          git merge-base --is-ancestor "$commit" origin/main
+          metadata_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          cli_version="$(python -c 'import pathlib,re; print(re.search("^VERSION = \"([^\"]+)\"$", pathlib.Path("services/cli.py").read_text(), re.M).group(1))')"
+          test "$GITHUB_REF_NAME" = "v$metadata_version"
+          test "$version" = "$cli_version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Build and validate Python artifacts
+        id: package
+        run: |
+          python -m pip install build twine
+          python -m build
+          twine check dist/*
+          python -m venv /tmp/portunusmcp-wheel
+          /tmp/portunusmcp-wheel/bin/pip install dist/*.whl
+          test "$(/tmp/portunusmcp-wheel/bin/portunusmcp --version)" = "portunusmcp ${{ steps.verify.outputs.version }}"
+          /tmp/portunusmcp-wheel/bin/portunusmcp --help >/dev/null
+          heads="$(/tmp/portunusmcp-wheel/bin/alembic heads)"
+          test "$heads" = "0007 (head)"
+          echo "alembic_head=0007" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+          retention-days: 7
+
+  build-release:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      gateway_digest: ${{ steps.manifest.outputs.gateway_digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: python-dist
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/portunusmcp
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest
-      - uses: docker/build-push-action@v6
+      - name: Reuse matching draft assets
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          if gh release view "$GITHUB_REF_NAME" --json tagName >/dev/null 2>&1; then
+            gh release download "$GITHUB_REF_NAME" --dir dist
+            (cd dist && sha256sum --check SHA256SUMS)
+            tar --wildcards -xOf dist/portunusmcp-v*-production.tar.gz '*/release.json' > /tmp/release.json
+            python -c 'import json,sys; d=json.load(open("/tmp/release.json")); assert d["tag"] == sys.argv[1] and d["commit"] == sys.argv[2]' "$GITHUB_REF_NAME" "${{ needs.prepare.outputs.commit }}"
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build and push immutable image
+        if: steps.existing.outputs.reuse != 'true'
         id: push
+        uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-      - name: Publish immutable image reference
+          tags: ${{ env.IMAGE }}:${{ needs.prepare.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+      - name: Resolve exact image manifests
+        if: steps.existing.outputs.reuse != 'true'
+        id: images
+        env:
+          GATEWAY_DIGEST: ${{ steps.push.outputs.digest }}
         run: |
-          echo '### Production image' >> "$GITHUB_STEP_SUMMARY"
-          echo "\`ghcr.io/${{ github.repository_owner }}/portunusmcp@${{ steps.push.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          inspect() {
+            report="$(docker buildx imagetools inspect "$1")"
+            grep -q 'linux/amd64' <<<"$report"
+            grep -q 'linux/arm64' <<<"$report"
+            awk '$1 == "Digest:" {print $2; exit}' <<<"$report"
+          }
+          test "$(inspect "$IMAGE@$GATEWAY_DIGEST")" = "$GATEWAY_DIGEST"
+          echo "gateway=$GATEWAY_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "postgres=$(inspect postgres:16)" >> "$GITHUB_OUTPUT"
+          echo "redis=$(inspect redis:7)" >> "$GITHUB_OUTPUT"
+          echo "prometheus=$(inspect prom/prometheus:v3.4.1)" >> "$GITHUB_OUTPUT"
+          echo "grafana=$(inspect grafana/grafana:12.0.2)" >> "$GITHUB_OUTPUT"
+      - name: Build deterministic production bundle
+        if: steps.existing.outputs.reuse != 'true'
+        run: |
+          artifacts=()
+          for artifact in python-dist/*; do
+            artifacts+=(--python-artifact "$artifact")
+          done
+          python scripts/build_release_bundle.py \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "${{ needs.prepare.outputs.commit }}" \
+            --alembic-head "${{ needs.prepare.outputs.alembic_head }}" \
+            --gateway-digest "${{ steps.images.outputs.gateway }}" \
+            --postgres-digest "${{ steps.images.outputs.postgres }}" \
+            --redis-digest "${{ steps.images.outputs.redis }}" \
+            --prometheus-digest "${{ steps.images.outputs.prometheus }}" \
+            --grafana-digest "${{ steps.images.outputs.grafana }}" \
+            "${artifacts[@]}" \
+            --output-dir dist
+          cp python-dist/* dist/
+          (
+            cd dist
+            sha256sum portunusmcp-*.whl portunusmcp-${{ needs.prepare.outputs.version }}.tar.gz \
+              portunusmcp-v${{ needs.prepare.outputs.version }}-production.tar.gz > SHA256SUMS
+          )
+      - name: Create draft GitHub Release
+        if: steps.existing.outputs.reuse != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          awk '/^## \[0.1.0\]/{copy=1; next} copy && /^## /{exit} copy{print}' CHANGELOG.md \
+            > /tmp/release-notes.md
+          {
+            echo
+            echo "### Exact artifacts"
+            echo
+            echo "| Artifact | Immutable identity |"
+            echo "|---|---|"
+            echo "| Gateway image | \`$IMAGE@${{ steps.images.outputs.gateway }}\` |"
+            echo "| Alembic head | \`${{ needs.prepare.outputs.alembic_head }}\` |"
+            echo "| Production bundle | \`portunusmcp-v${{ needs.prepare.outputs.version }}-production.tar.gz\` |"
+            echo "| Operator CLI | \`portunusmcp==${{ needs.prepare.outputs.version }}\` |"
+            echo
+            echo "Verify all downloads with the attached \`SHA256SUMS\`."
+            echo "See [compatibility](https://github.com/${{ github.repository }}/blob/$GITHUB_REF_NAME/COMPATIBILITY.md) and [upgrade](https://github.com/${{ github.repository }}/blob/$GITHUB_REF_NAME/UPGRADING.md) notes."
+          } >> /tmp/release-notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --draft \
+            --verify-tag \
+            --title "PortunusMCP $GITHUB_REF_NAME" \
+            --notes-file /tmp/release-notes.md
+      - name: Verify all release manifests
+        run: |
+          tar --wildcards -xOf dist/portunusmcp-v*-production.tar.gz '*/release.json' > /tmp/release.json
+          python - <<'PY' > /tmp/image-references
+          import json
+          data = json.load(open("/tmp/release.json"))
+          for image in data["images"].values():
+              print(image["reference"])
+          PY
+          while read -r image; do
+            report="$(docker buildx imagetools inspect "$image")"
+            grep -q 'linux/amd64' <<<"$report"
+            grep -q 'linux/arm64' <<<"$report"
+          done < /tmp/image-references
+      - name: Export release identity
+        id: manifest
+        run: |
+          digest="$(python -c 'import json; print(json.load(open("/tmp/release.json"))["images"]["gateway"]["digest"])')"
+          echo "gateway_digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "### Draft image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$IMAGE@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+          retention-days: 7
+
+  smoke:
+    needs: [prepare, build-release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Install Docker Compose 5
+        run: |
+          test "$(docker version --format '{{.Server.Version}}')" != ""
+          test "$(docker version --format '{{.Server.Version}}' | cut -d. -f1)" = "29"
+          sudo mkdir -p /usr/local/lib/docker/cli-plugins
+          sudo curl -fsSL \
+            "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose
+          sudo chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+          docker compose version | grep -q 'v5\.'
+      - name: Verify and install release assets
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          tar -xzf dist/portunusmcp-v${{ needs.prepare.outputs.version }}-production.tar.gz
+          wheel="$(find dist -name '*.whl' -print -quit)"
+          python -m pip install "${wheel}[dev]"
+      - name: Anonymous pull and production smoke
+        env:
+          REQUIRE_DOCKER_TESTS: "1"
+          PORTUNUSMCP_RELEASE_ROOT: ${{ github.workspace }}/portunusmcp-v${{ needs.prepare.outputs.version }}
+          PORTUNUSMCP_RELEASE_IMAGE: ${{ env.IMAGE }}@${{ needs.build-release.outputs.gateway_digest }}
+        run: |
+          docker logout ghcr.io || true
+          docker pull "$PORTUNUSMCP_RELEASE_IMAGE"
+          pytest tests/integration/test_release_artifacts.py -q
+
+  upgrade:
+    needs: [prepare, build-release]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: phase-6
+            commit: 95e04cf7e5a2261b4b7d8ac0870fca8948c90cde
+          - name: phase-6.1
+            commit: dbec74ec3a7f27a5b31c16372613ec4178dee523
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Install Docker Compose 5
+        run: |
+          test "$(docker version --format '{{.Server.Version}}' | cut -d. -f1)" = "29"
+          sudo mkdir -p /usr/local/lib/docker/cli-plugins
+          sudo curl -fsSL \
+            "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose
+          sudo chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+          docker compose version | grep -q 'v5\.'
+      - name: Build supported predecessor
+        run: |
+          git worktree add /tmp/portunusmcp-old "${{ matrix.commit }}"
+          docker build -t "portunusmcp:${{ matrix.name }}" /tmp/portunusmcp-old
+      - name: Verify and install release assets
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          tar -xzf dist/portunusmcp-v${{ needs.prepare.outputs.version }}-production.tar.gz
+          wheel="$(find dist -name '*.whl' -print -quit)"
+          python -m pip install "${wheel}[dev]"
+      - name: Rehearse persisted-state upgrade
+        env:
+          REQUIRE_DOCKER_TESTS: "1"
+          PORTUNUSMCP_RELEASE_ROOT: ${{ github.workspace }}/portunusmcp-v${{ needs.prepare.outputs.version }}
+          PORTUNUSMCP_RELEASE_IMAGE: ${{ env.IMAGE }}@${{ needs.build-release.outputs.gateway_digest }}
+          PORTUNUSMCP_UPGRADE_FROM_IMAGE: portunusmcp:${{ matrix.name }}
+        run: pytest tests/integration/test_release_artifacts.py -q
+
+  publish-pypi:
+    needs: [prepare, smoke, upgrade]
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Check for an exact existing PyPI release
+        id: pypi
+        run: |
+          if curl -fsS "https://pypi.org/pypi/portunusmcp/${{ needs.prepare.outputs.version }}/json" \
+            -o /tmp/pypi.json; then
+            python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          published = {
+              item["filename"]: item["digests"]["sha256"]
+              for item in json.load(open("/tmp/pypi.json"))["urls"]
+          }
+          local = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in Path("dist").iterdir()
+              if path.suffix == ".whl" or path.name == "portunusmcp-${{ needs.prepare.outputs.version }}.tar.gz"
+          }
+          assert published == local
+          PY
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Select Python distributions
+        if: steps.pypi.outputs.exists != 'true'
+        run: |
+          mkdir python-dist
+          cp dist/*.whl dist/portunusmcp-${{ needs.prepare.outputs.version }}.tar.gz python-dist/
+      - name: Publish to PyPI
+        if: steps.pypi.outputs.exists != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python-dist/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify public PyPI installation
+        run: |
+          for attempt in {1..12}; do
+            if python -m pip install --no-cache-dir "portunusmcp==${{ needs.prepare.outputs.version }}"; then
+              break
+            fi
+            test "$attempt" != 12
+            sleep 10
+          done
+          test "$(portunusmcp --version)" = "portunusmcp ${{ needs.prepare.outputs.version }}"
+
+  publish:
+    needs: [prepare, build-release, publish-pypi]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote tested digest to latest
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE:latest" \
+            "$IMAGE@${{ needs.build-release.outputs.gateway_digest }}"
+          report="$(docker buildx imagetools inspect "$IMAGE:latest")"
+          grep -q "${{ needs.build-release.outputs.gateway_digest }}" <<<"$report"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+      - name: Publish summary
+        run: |
+          echo "### PortunusMCP $GITHUB_REF_NAME published" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`$IMAGE@${{ needs.build-release.outputs.gateway_digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`portunusmcp==${{ needs.prepare.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
