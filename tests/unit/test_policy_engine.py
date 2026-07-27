@@ -322,3 +322,75 @@ def test_existing_bearer_yaml_shape_still_loads() -> None:
     engine = make_engine([READONLY])
     identity = engine.identity("agent-readonly")
     assert identity is not None and identity.auth_mode == "bearer"
+
+
+# --- identity index collision validation (item 43) ---
+
+
+def test_duplicate_identity_id_fails_with_positions() -> None:
+    with pytest.raises(
+        ValidationError,
+        match=r"duplicate identity id 'same' at identities\[0\] and identities\[1\]",
+    ):
+        make_engine(
+            [
+                {"id": "same", "api_key_hash": "sha256:first"},
+                {"id": "same", "api_key_hash": "sha256:second"},
+            ]
+        )
+
+
+def test_duplicate_api_key_hash_names_both_identities() -> None:
+    with pytest.raises(
+        ValidationError,
+        match=r"duplicate api_key_hash 'sha256:same' for identities 'first' and 'second'",
+    ):
+        make_engine(
+            [
+                {"id": "first", "api_key_hash": "sha256:same"},
+                {"id": "second", "api_key_hash": "sha256:same"},
+            ]
+        )
+
+
+def test_duplicate_signed_key_id_names_both_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLICY_TEST_SECRET_A", "secret-a")
+    monkeypatch.setenv("POLICY_TEST_SECRET_B", "secret-b")
+    with pytest.raises(
+        ValidationError,
+        match=r"duplicate key_id 'kid_same' for identities 'first' and 'second'",
+    ):
+        make_engine(
+            [
+                {
+                    "id": "first",
+                    "auth_mode": "signed",
+                    "key_id": "kid_same",
+                    "signing_secret_env": "POLICY_TEST_SECRET_A",
+                },
+                {
+                    "id": "second",
+                    "auth_mode": "signed",
+                    "key_id": "kid_same",
+                    "signing_secret_env": "POLICY_TEST_SECRET_B",
+                },
+            ]
+        )
+
+
+def test_policy_store_keeps_last_known_good_on_duplicate_identity(tmp_path: Path) -> None:
+    path = tmp_path / "policy.yaml"
+    path.write_text("version: 1\nidentities: []\n")
+    store = policy_engine.PolicyStore(path)
+    path.write_text(
+        """
+version: 2
+identities:
+  - {id: duplicate, api_key_hash: "sha256:first"}
+  - {id: duplicate, api_key_hash: "sha256:second"}
+"""
+    )
+    assert store.reload() is False
+    assert store.engine.version == 1

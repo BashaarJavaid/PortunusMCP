@@ -50,6 +50,8 @@ services:
       MAX_INFLIGHT_CALLS_PER_IDENTITY: ${MAX_INFLIGHT_CALLS_PER_IDENTITY:-5}
       TOOL_CALL_RATE_LIMIT: ${TOOL_CALL_RATE_LIMIT:-60}
       TOOL_CALL_RATE_WINDOW_SECONDS: ${TOOL_CALL_RATE_WINDOW_SECONDS:-60}
+      AUTH_FAILURE_RATE_LIMIT: ${AUTH_FAILURE_RATE_LIMIT:-5}
+      AUTH_FAILURE_RATE_WINDOW_SECONDS: ${AUTH_FAILURE_RATE_WINDOW_SECONDS:-300}
       TOOL_CALL_DEADLINE_SECONDS: ${TOOL_CALL_DEADLINE_SECONDS:-60}
       READINESS_TIMEOUT_SECONDS: ${READINESS_TIMEOUT_SECONDS:-1.0}
       ALLOWED_HOSTS: '${ALLOWED_HOSTS:-["localhost:*","127.0.0.1:*"]}'
@@ -128,6 +130,7 @@ services:
     profiles: ["monitoring"]
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
     ports:
       - "9090:9090"
 

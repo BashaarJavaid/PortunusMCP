@@ -85,6 +85,28 @@ def signed_call_body(gw: SignedGateway, text: str, id: int = 2) -> bytes:  # noq
     return json.dumps(call).encode()
 
 
+def unknown_key_initialize(gw: SignedGateway) -> dict[str, Any]:
+    nonce, timestamp = str(uuid.uuid4()), int(time.time())
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": LATEST_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "adversary", "version": "0"},
+            "_meta": {
+                NONCE_META_KEY: nonce,
+                TIMESTAMP_META_KEY: timestamp,
+                auth.KEY_ID_META_KEY: "kid_unknown",
+                auth.SIGNATURE_META_KEY: auth.sign_request(
+                    b"guessed-secret", nonce, timestamp, "initialize", None, None
+                ),
+            },
+        },
+    }
+
+
 async def test_captured_signed_request_cannot_be_replayed(signed_gateway: SignedGateway) -> None:
     gw = signed_gateway
     async with httpx.AsyncClient() as client:
@@ -125,28 +147,39 @@ async def test_tampered_arguments_are_rejected_at_the_edge(
         assert response.status_code == 401
 
 
-async def test_unknown_key_id_gets_no_session(signed_gateway: SignedGateway) -> None:
+async def test_unknown_key_id_is_source_throttled_and_gets_no_session(
+    signed_gateway: SignedGateway,
+) -> None:
     gw = signed_gateway
-    nonce, timestamp = str(uuid.uuid4()), int(time.time())
-    init = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": LATEST_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "adversary", "version": "0"},
-            "_meta": {
-                NONCE_META_KEY: nonce,
-                TIMESTAMP_META_KEY: timestamp,
-                auth.KEY_ID_META_KEY: "kid_unknown",
-                auth.SIGNATURE_META_KEY: auth.sign_request(
-                    b"guessed-secret", nonce, timestamp, "initialize", None, None
-                ),
-            },
-        },
-    }
+    headers = {**HEADERS, "X-Forwarded-For": "198.51.100.30"}
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{gw.url}/mcp/default", headers=HEADERS, json=init)
-        assert response.status_code == 401
+        for attempt in range(6):
+            response = await client.post(
+                f"{gw.url}/mcp/default",
+                headers=headers,
+                json=unknown_key_initialize(gw),
+            )
+            assert response.status_code == (401 if attempt < 5 else 429)
         assert "mcp-session-id" not in response.headers
+        assert int(response.headers["Retry-After"]) > 0
+
+
+async def test_auth_block_does_not_break_existing_signed_get_or_delete(
+    signed_gateway: SignedGateway,
+) -> None:
+    gw = signed_gateway
+    source_headers = {"X-Forwarded-For": "198.51.100.31"}
+    async with httpx.AsyncClient(headers=source_headers, timeout=5) as client:
+        session_headers = await handshake(client, gw)
+        for _ in range(6):
+            response = await client.post(
+                f"{gw.url}/mcp/default",
+                headers=HEADERS,
+                json=unknown_key_initialize(gw),
+            )
+        assert response.status_code == 429
+
+        async with client.stream("GET", f"{gw.url}/mcp/default", headers=session_headers) as stream:
+            assert stream.status_code == 200
+        deleted = await client.delete(f"{gw.url}/mcp/default", headers=session_headers)
+        assert deleted.status_code == 200

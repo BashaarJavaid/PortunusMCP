@@ -8,7 +8,6 @@ from typing import Any
 from services.gateway.decision import RiskFactor
 from services.gateway.policy_engine import RiskPolicy
 from services.gateway.risk_engine import (
-    AUTH_FAILURE_CONTRIBUTION,
     DRIFT_HISTORY_CONTRIBUTION,
     DRIFT_IN_REVIEW_CONTRIBUTION,
     FREQUENCY_CONTRIBUTION,
@@ -17,7 +16,6 @@ from services.gateway.risk_engine import (
     PROTECTED_CONTRIBUTION,
     TIER_CONTRIBUTION,
     RiskContext,
-    _auth_failures,
     _blast_radius,
     _business_hours,
     _call_frequency,
@@ -41,7 +39,6 @@ def ctx(**overrides: Any) -> RiskContext:
         "call_count": 1,
         "drift_in_review": False,
         "denial_count": 0,
-        "auth_failure_count": 0,
         "drift_event_count": 0,
         "suspicious_baseline": False,
     }
@@ -98,12 +95,6 @@ def test_prior_denial_rate_threshold() -> None:
     assert "agent-readonly" in (factor.reason or "")
 
 
-def test_auth_failures_threshold() -> None:
-    assert _auth_failures(ctx(auth_failure_count=5)) is None  # at threshold: no spike
-    factor = _auth_failures(ctx(auth_failure_count=6))
-    assert factor is not None and factor.contribution == AUTH_FAILURE_CONTRIBUTION
-
-
 def test_drift_history_threshold() -> None:
     # "Changed shape twice in the last week": fires *at* the threshold, unlike the
     # spike-style counters that fire only above theirs.
@@ -129,17 +120,16 @@ def test_decay_discounts_behavioral_factors_only() -> None:
     assert combine(_factors(), decay_offset=1000) == 30  # tier survives any decay
 
 
-def test_decay_covers_prior_denials_but_not_auth_failures_or_drift_history() -> None:
-    """Item 18 boundary: §4.8 names prior-denial-rate behavioral (decayable); the
-    gateway-wide stuffing signal and the tool's instability record are not."""
+def test_decay_covers_prior_denials_but_not_drift_history() -> None:
+    """Item 18 boundary: prior-denial-rate is behavioral (decayable), while the
+    tool's instability record is not."""
     factors = [
         RiskFactor(factor="prior_denial_rate", contribution=25),
-        RiskFactor(factor="auth_failures", contribution=20),
         RiskFactor(factor="drift_history", contribution=15),
     ]
-    assert combine(factors, decay_offset=0) == 60
-    assert combine(factors, decay_offset=10) == 50  # discounts the denial subtotal
-    assert combine(factors, decay_offset=1000) == 35  # auth + drift history survive
+    assert combine(factors, decay_offset=0) == 40
+    assert combine(factors, decay_offset=10) == 30
+    assert combine(factors, decay_offset=1000) == 15
 
 
 def test_combine_clamps_to_100() -> None:

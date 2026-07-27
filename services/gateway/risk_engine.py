@@ -13,10 +13,10 @@ so rubber-stamp approvals dampen behavioral scoring but can't switch it off, and
 never desensitize the engine to an inherently dangerous tool's static tier.
 
 Item 18 telemetry: prior-denial-rate (per-identity Redis rolling counter, bumped by
-the interceptor on every DENY_* terminal), auth-failures (the Auth Layer's gateway-
-wide failed-lookup counter), and drift-history (DRIFT_* audit events for the tool in
-a rolling window, surviving re-approval). Counter *writes* are best-effort at their
-call sites; the *reads* here raise on failure like every other input — fail closed.
+the interceptor on every DENY_* terminal) and drift-history (DRIFT_* audit events for
+the tool in a rolling window, surviving re-approval). Counter *writes* are best-effort
+at their call sites; the *reads* here raise on failure like every other input — fail
+closed. Item 43 moved failed authentication into source throttling, outside scoring.
 
 Scoring exceptions propagate to the caller, which must treat them as score 100 and
 deny (§5 fail-closed).
@@ -30,7 +30,6 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
-from services.gateway import auth
 from services.gateway.config import settings
 from services.gateway.decision import DecisionOutcome, RiskFactor
 from services.gateway.drift_detector import DriftDetector
@@ -46,14 +45,12 @@ OFF_HOURS_CONTRIBUTION = 25
 FREQUENCY_CONTRIBUTION = 20
 DRIFT_IN_REVIEW_CONTRIBUTION = 15
 PRIOR_DENIAL_CONTRIBUTION = 25
-AUTH_FAILURE_CONTRIBUTION = 20
 DRIFT_HISTORY_CONTRIBUTION = 15
 SUSPICIOUS_BASELINE_CONTRIBUTION = 20
 
 # Factors risk decay may discount — §4.8 names them exactly: call frequency,
 # prior-denial-rate, drift-in-review; never the tier, and deliberately not
-# auth_failures/drift_history (approving one call shouldn't erase a gateway-wide
-# stuffing signal or a tool's instability record).
+# drift_history (approving one call shouldn't erase a tool's instability record).
 BEHAVIORAL_FACTORS = frozenset({"call_frequency", "prior_denial_rate", "drift_in_review"})
 
 
@@ -67,7 +64,6 @@ class RiskContext:
     call_count: int  # calls for this identity+tool in the rolling window, incl. this one
     drift_in_review: bool
     denial_count: int  # DENY_* terminals for this identity in the rolling window
-    auth_failure_count: int  # gateway-wide failed key lookups in the rolling window
     drift_event_count: int  # DRIFT_* audit events for this tool in the rolling window
     suspicious_baseline: bool  # approved content matched the item-36b heuristics
 
@@ -158,20 +154,6 @@ def _prior_denial_rate(ctx: RiskContext) -> RiskFactor | None:
     )
 
 
-def _auth_failures(ctx: RiskContext) -> RiskFactor | None:
-    if ctx.auth_failure_count <= settings.risk_auth_failure_threshold:
-        return None
-    return RiskFactor(
-        factor="auth_failures",
-        contribution=AUTH_FAILURE_CONTRIBUTION,
-        reason=(
-            f"{ctx.auth_failure_count} failed API-key lookups gateway-wide in the last"
-            f" {settings.risk_auth_failure_window_seconds}s exceeds"
-            f" {settings.risk_auth_failure_threshold}"
-        ),
-    )
-
-
 def _drift_history(ctx: RiskContext) -> RiskFactor | None:
     if ctx.drift_event_count < settings.risk_drift_history_threshold:
         return None
@@ -207,7 +189,6 @@ FACTORS: list[Callable[[RiskContext], RiskFactor | None]] = [
     _call_frequency,
     _drift_in_review,
     _prior_denial_rate,
-    _auth_failures,
     _drift_history,
     _suspicious_baseline,
 ]
@@ -285,7 +266,6 @@ class RiskEngine:
             call_count=call_count,
             drift_in_review=await self._detector.has_pending_drift(server_id, tool_name),
             denial_count=await self._counter(_denial_key(identity_id)),
-            auth_failure_count=await self._counter(auth.AUTH_FAILURE_KEY),
             drift_event_count=await self._detector.recent_drift_count(
                 server_id,
                 tool_name,

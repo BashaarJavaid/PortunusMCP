@@ -110,12 +110,15 @@ def _write_env(
         "GRAFANA_PORT": str(ports["grafana"]),
         "ALLOWED_HOSTS": '["127.0.0.1:*","localhost:*"]',
         "ALLOWED_ORIGINS": "[]",
+        "FORWARDED_ALLOW_IPS": "*",
         "MAX_MCP_BODY_BYTES": "1048576",
         "MAX_JSON_DEPTH": "32",
         "MAX_SESSIONS_PER_IDENTITY": "3",
         "MAX_INFLIGHT_CALLS_PER_IDENTITY": "5",
         "TOOL_CALL_RATE_LIMIT": "60",
         "TOOL_CALL_RATE_WINDOW_SECONDS": "60",
+        "AUTH_FAILURE_RATE_LIMIT": "5",
+        "AUTH_FAILURE_RATE_WINDOW_SECONDS": "300",
         "TOOL_CALL_DEADLINE_SECONDS": "60",
         "READINESS_TIMEOUT_SECONDS": "1.0",
         "SCHEMA_CACHE_TTL": "600",
@@ -131,8 +134,6 @@ def _write_env(
         "RISK_DECAY_TTL_SECONDS": "2592000",
         "RISK_DENIAL_WINDOW_SECONDS": "600",
         "RISK_DENIAL_THRESHOLD": "3",
-        "RISK_AUTH_FAILURE_WINDOW_SECONDS": "300",
-        "RISK_AUTH_FAILURE_THRESHOLD": "5",
         "RISK_DRIFT_HISTORY_WINDOW_SECONDS": "604800",
         "RISK_DRIFT_HISTORY_THRESHOLD": "2",
         "DRIFT_DESCRIPTION_SEVERITY": "high",
@@ -245,6 +246,7 @@ async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -
     assert services["prometheus"]["image"].startswith("prom/prometheus:v3.4.1@sha256:")
     assert services["grafana"]["image"].startswith("grafana/grafana:12.0.2@sha256:")
     assert "GRAFANA_ADMIN_PASSWORD" not in services["gateway"]["environment"]
+    assert services["gateway"]["environment"]["FORWARDED_ALLOW_IPS"] == "*"
     for service in ALL_SERVICES:
         assert services[service]["read_only"] is True
         assert services[service]["cap_drop"] == ["ALL"]
@@ -328,6 +330,18 @@ async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -
         )
         assert "appendonly\nyes" in redis_config
         assert "appendfsync\neverysec" in redis_config
+        assert "SUCCESS: 1 rules found" in _compose(
+            env_file,
+            project,
+            override,
+            "exec",
+            "-T",
+            "prometheus",
+            "promtool",
+            "check",
+            "rules",
+            "/etc/prometheus/alerts.yml",
+        )
 
         async with httpx.AsyncClient() as client:
             assert (

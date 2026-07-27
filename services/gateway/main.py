@@ -204,7 +204,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runtime = await upstream_client.DockerRuntime.create(store.engine.policy.servers)
     app.state.upstream_runtime = runtime
     redis_client: aioredis.Redis = aioredis.Redis.from_url(settings.redis_url)
-    app.state.redis = redis_client  # auth-failure counter (§4.8, item 18)
+    app.state.redis = redis_client  # source auth limiter and other short-TTL state
     writer = AuditWriter(redis_client, async_session, store, signing_key, key_id)
     app.state.audit_writer = writer  # rollback endpoint (item 19)
     # Record + audit the boot-time activation (item 19). A monotonicity conflict
@@ -342,13 +342,7 @@ async def approve_tool(server_id: str, tool_name: str, request: Request) -> dict
     """Drift re-approval (§4.8): snapshot the observed schema as the accepted baseline.
     Audited, authenticated admin action — requires a key resolving to an admin identity."""
     store: PolicyStore = request.app.state.policy_store
-    identity_id = await auth.resolve_identity_tracked(
-        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
-    )
-    if identity_id is None:
-        raise HTTPException(status_code=401, detail="invalid or missing API key")
-    if not store.engine.is_admin(identity_id):
-        raise HTTPException(status_code=403, detail="admin identity required")
+    identity_id = await _require_admin(request)
     detector: DriftDetector = request.app.state.drift_detector
     try:
         seq = await detector.approve(server_id, tool_name, approved_by=identity_id)
@@ -372,13 +366,7 @@ async def approve_call(approval_id: str, request: Request) -> dict[str, object]:
     Also applies one risk-decay step for the (identity, tool) pair — a human judged
     this high-risk call fine, and that calibrates future behavioral scoring."""
     store: PolicyStore = request.app.state.policy_store
-    identity_id = await auth.resolve_identity_tracked(
-        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
-    )
-    if identity_id is None:
-        raise HTTPException(status_code=401, detail="invalid or missing API key")
-    if not store.engine.is_admin(identity_id):
-        raise HTTPException(status_code=403, detail="admin identity required")
+    identity_id = await _require_admin(request)
     approval_store: ApprovalStore = request.app.state.approval_store
     try:
         seq, requester_id, server_id, tool_name = await approval_store.approve(
@@ -404,13 +392,7 @@ async def approve_call(approval_id: str, request: Request) -> dict[str, object]:
 async def rollback_policy(version: int, request: Request) -> dict[str, object]:
     """Durably re-activate a prior policy revision."""
     store: PolicyStore = request.app.state.policy_store
-    identity_id = await auth.resolve_identity_tracked(
-        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
-    )
-    if identity_id is None:
-        raise HTTPException(status_code=401, detail="invalid or missing API key")
-    if not store.engine.is_admin(identity_id):
-        raise HTTPException(status_code=403, detail="admin identity required")
+    identity_id = await _require_admin(request)
     snapshot = policy_versions.snapshot_path(version)
     if not snapshot.exists():
         raise HTTPException(status_code=404, detail=f"no revision snapshot for v{version}")
@@ -450,9 +432,22 @@ async def rollback_policy(version: int, request: Request) -> dict[str, object]:
 async def _require_admin(request: Request) -> str:
     """Shared /admin/* auth (item 20 endpoints): key resolves to an admin identity."""
     store: PolicyStore = request.app.state.policy_store
-    identity_id = await auth.resolve_identity_tracked(
-        request.headers.get(KEY_HEADER), store.engine, request.app.state.redis
-    )
+    try:
+        identity_id = await auth.resolve_identity_tracked(
+            request.headers.get(KEY_HEADER),
+            store.engine,
+            request.app.state.redis,
+            auth.client_source(request.scope),
+            "admin",
+        )
+    except auth.AuthRateLimited as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="authentication rate limit exceeded",
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+    except auth.AuthLimiterUnavailable as exc:
+        raise HTTPException(status_code=503, detail="authentication limiter unavailable") from exc
     if identity_id is None:
         raise HTTPException(status_code=401, detail="invalid or missing API key")
     if not store.engine.is_admin(identity_id):
@@ -1049,28 +1044,47 @@ async def mcp_endpoint(scope: Scope, receive: Receive, send: Send) -> None:
     # Bearer: the key header, hash-and-lookup. Signed (item 34): no header — the
     # POSTed message carries key id + HMAC in params._meta, verified here at the
     # edge so a forged signature is an HTTP 401, never a parsed session message.
-    if headers.get(KEY_HEADER) is not None:
-        identity_id = await auth.resolve_identity_tracked(
-            headers.get(KEY_HEADER), engine, scope["app"].state.redis
-        )
-    elif scope["method"] == "POST":
-        identity_id = None
-        if parsed is not None:
-            identity_id = await auth.verify_signed_request_tracked(
-                parsed, engine, scope["app"].state.redis
+    try:
+        if headers.get(KEY_HEADER) is not None:
+            identity_id = await auth.resolve_identity_tracked(
+                headers.get(KEY_HEADER),
+                engine,
+                scope["app"].state.redis,
+                auth.client_source(scope),
+                "mcp",
             )
-    else:
-        # GET (SSE stream) / DELETE carry no JSON-RPC body to sign. A signed
-        # session was created by a signature-verified initialize, so possession of
-        # its session id binds these to that identity (residual exposure — reading
-        # the response stream off a captured session id — is documented, item 34).
-        identity_id = None
-        if session_id is not None:
-            session = manager.get(session_id)
-            if session is not None:
-                identity = engine.identity(session.interceptor.identity_id)
-                if identity is not None and identity.auth_mode == "signed":
-                    identity_id = session.interceptor.identity_id
+        elif scope["method"] == "POST":
+            identity_id = None
+            if parsed is not None:
+                identity_id = await auth.verify_signed_request_tracked(
+                    parsed,
+                    engine,
+                    scope["app"].state.redis,
+                    auth.client_source(scope),
+                    "mcp",
+                )
+        else:
+            # GET (SSE stream) / DELETE carry no JSON-RPC body to sign. A signed
+            # session was created by a signature-verified initialize, so possession of
+            # its session id binds these to that identity (residual exposure — reading
+            # the response stream off a captured session id — is documented, item 34).
+            identity_id = None
+            if session_id is not None:
+                session = manager.get(session_id)
+                if session is not None:
+                    identity = engine.identity(session.interceptor.identity_id)
+                    if identity is not None and identity.auth_mode == "signed":
+                        identity_id = session.interceptor.identity_id
+    except auth.AuthRateLimited as exc:
+        await Response(
+            "authentication rate limit exceeded",
+            status_code=429,
+            headers={"Retry-After": str(exc.retry_after)},
+        )(scope, receive, send)
+        return
+    except auth.AuthLimiterUnavailable:
+        await Response("authentication limiter unavailable", status_code=503)(scope, receive, send)
+        return
     if identity_id is None:
         await Response("invalid or missing API key or signature", status_code=401)(
             scope, receive, send

@@ -13,6 +13,8 @@ from services.gateway.config import Settings
         "max_inflight_calls_per_identity",
         "tool_call_rate_limit",
         "tool_call_rate_window_seconds",
+        "auth_failure_rate_limit",
+        "auth_failure_rate_window_seconds",
         "tool_call_deadline_seconds",
         "readiness_timeout_seconds",
     ],

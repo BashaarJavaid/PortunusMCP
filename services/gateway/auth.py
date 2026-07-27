@@ -10,31 +10,110 @@ carries a non-secret key id plus an HMAC-SHA256 over the canonical
 a secret the gateway resolves from the environment at policy load. A captured signed
 request contains no credential, so a fresh nonce cannot be re-signed.
 
-Item 18 adds the auth-failure counter: one gateway-wide Redis rolling counter bumped
-on every failed key lookup (and, item 34, every unknown key id or bad signature) — a
-spike just before a successful call is a classic credential-stuffing pattern, so the
-Risk Engine reads it as a factor for every identity while the spike is live. Counting
-is best-effort telemetry: Redis being down must keep producing 401s, never 500s.
+Item 43 replaces the old gateway-wide risk signal with a source-scoped fixed-window
+limiter shared by MCP and admin authentication. Uvicorn resolves trusted proxy
+headers before this module sees the ASGI scope; only the resulting client IP is used.
+Redis failure fails closed because the limiter is now a preventive control.
 """
 
 import hashlib
 import hmac
-from typing import Any
+from collections.abc import Awaitable, Mapping
+from typing import Any, Literal, cast
 
 import canonicaljson
 import redis.asyncio as aioredis
 import structlog
 
+from services.gateway import metrics
 from services.gateway.config import settings
 from services.gateway.policy_engine import PolicyEngine
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
 
 logger = structlog.get_logger(__name__)
 
-AUTH_FAILURE_KEY = "risk:auth_failures"
-
 KEY_ID_META_KEY = "portunusmcp/key-id"
 SIGNATURE_META_KEY = "portunusmcp/signature"
+
+_FAILURE_SCRIPT = """
+local count = redis.call("INCR", KEYS[1])
+if count == 1 then
+  redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+return {count, redis.call("TTL", KEYS[1])}
+"""
+
+
+class AuthRateLimited(Exception):
+    def __init__(self, retry_after: int) -> None:
+        self.retry_after = retry_after
+
+
+class AuthLimiterUnavailable(Exception):
+    pass
+
+
+def client_source(scope: Mapping[str, Any]) -> str | None:
+    client = scope.get("client")
+    if not isinstance(client, tuple | list) or not client or not isinstance(client[0], str):
+        return None
+    return client[0] or None
+
+
+def _failure_key(source: str) -> str:
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    return f"rate:auth_failure:{digest}"
+
+
+async def _blocked_ttl(redis_client: aioredis.Redis, source: str) -> int | None:
+    key = _failure_key(source)
+    try:
+        raw = await redis_client.get(key)
+        if int(raw or 0) <= settings.auth_failure_rate_limit:
+            return None
+        ttl: int = await redis_client.ttl(key)
+    except Exception as exc:
+        raise AuthLimiterUnavailable from exc
+    return max(ttl, 1) if ttl > 0 else None
+
+
+def _throttled(retry_after: int) -> None:
+    metrics.AUTH_THROTTLED.inc()
+    raise AuthRateLimited(retry_after)
+
+
+async def _check_source(redis_client: aioredis.Redis, source: str) -> None:
+    if (retry_after := await _blocked_ttl(redis_client, source)) is not None:
+        _throttled(retry_after)
+
+
+async def _record_failure(
+    redis_client: aioredis.Redis,
+    source: str,
+    surface: Literal["mcp", "admin"],
+) -> None:
+    try:
+        result = await cast(
+            Awaitable[Any],
+            redis_client.eval(
+                _FAILURE_SCRIPT,
+                1,
+                _failure_key(source),
+                str(settings.auth_failure_rate_window_seconds),
+            ),
+        )
+        count, ttl = int(result[0]), max(int(result[1]), 1)
+    except Exception as exc:
+        raise AuthLimiterUnavailable from exc
+    if count > settings.auth_failure_rate_limit:
+        if count == settings.auth_failure_rate_limit + 1:
+            logger.warning(
+                "auth_source_throttled",
+                source=source,
+                surface=surface,
+                retry_after_seconds=ttl,
+            )
+        _throttled(ttl)
 
 
 def resolve_identity(api_key: str | None, engine: PolicyEngine) -> str | None:
@@ -44,25 +123,23 @@ def resolve_identity(api_key: str | None, engine: PolicyEngine) -> str | None:
     return engine.identity_for_key_hash(f"sha256:{digest}")
 
 
-async def _count_failure(redis_client: aioredis.Redis) -> None:
-    """Best-effort bump of the gateway-wide failure counter (item 18): same
-    INCR + EXPIRE-on-first rolling window as the risk:freq counters."""
-    try:
-        count = await redis_client.incr(AUTH_FAILURE_KEY)
-        if count == 1:
-            await redis_client.expire(AUTH_FAILURE_KEY, settings.risk_auth_failure_window_seconds)
-    except Exception:
-        logger.exception("auth_failure_count_unavailable")
-
-
 async def resolve_identity_tracked(
-    api_key: str | None, engine: PolicyEngine, redis_client: aioredis.Redis
+    api_key: str | None,
+    engine: PolicyEngine,
+    redis_client: aioredis.Redis,
+    source: str | None,
+    surface: Literal["mcp", "admin"],
 ) -> str | None:
-    """resolve_identity plus the failure counter: a *wrong* key counts (that's the
-    stuffing signal); a missing header does not."""
+    """Resolve a presented bearer key under the source limiter. Missing keys remain
+    ordinary uncounted 401s at the caller."""
+    if not api_key:
+        return None
+    if source is None:
+        raise AuthLimiterUnavailable
+    await _check_source(redis_client, source)
     identity_id = resolve_identity(api_key, engine)
-    if identity_id is None and api_key:
-        await _count_failure(redis_client)
+    if identity_id is None:
+        await _record_failure(redis_client, source, surface)
     return identity_id
 
 
@@ -132,17 +209,25 @@ def verify_signed_request(message: dict[str, Any], engine: PolicyEngine) -> str 
 
 
 async def verify_signed_request_tracked(
-    message: dict[str, Any], engine: PolicyEngine, redis_client: aioredis.Redis
+    message: dict[str, Any],
+    engine: PolicyEngine,
+    redis_client: aioredis.Redis,
+    source: str | None,
+    surface: Literal["mcp", "admin"],
 ) -> str | None:
-    """verify_signed_request plus the failure counter: a presented-but-wrong key id
-    or signature counts (forgery/stuffing signal); a request with no key material
-    at all does not — mirroring the bearer path."""
+    """Verify presented signed credentials under the source limiter. Requests with
+    no key material remain ordinary uncounted 401s at the caller."""
+    params = message.get("params") if isinstance(message, dict) else None
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    presented = isinstance(meta, dict) and (
+        meta.get(KEY_ID_META_KEY) is not None or meta.get(SIGNATURE_META_KEY) is not None
+    )
+    if not presented:
+        return verify_signed_request(message, engine)
+    if source is None:
+        raise AuthLimiterUnavailable
+    await _check_source(redis_client, source)
     identity_id = verify_signed_request(message, engine)
     if identity_id is None:
-        params = message.get("params") if isinstance(message, dict) else None
-        meta = params.get("_meta") if isinstance(params, dict) else None
-        if isinstance(meta, dict) and (
-            meta.get(KEY_ID_META_KEY) is not None or meta.get(SIGNATURE_META_KEY) is not None
-        ):
-            await _count_failure(redis_client)
+        await _record_failure(redis_client, source, surface)
     return identity_id

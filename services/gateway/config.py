@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     max_inflight_calls_per_identity: int = Field(default=5, gt=0)
     tool_call_rate_limit: int = Field(default=60, gt=0)
     tool_call_rate_window_seconds: int = Field(default=60, gt=0)
+    auth_failure_rate_limit: int = Field(default=5, gt=0)
+    auth_failure_rate_window_seconds: int = Field(default=300, gt=0)
     tool_call_deadline_seconds: int = Field(default=60, gt=0)
     readiness_timeout_seconds: float = Field(default=1.0, gt=0)
     allowed_hosts: list[str] = ["localhost:*", "127.0.0.1:*"]
@@ -53,10 +55,6 @@ class Settings(BaseSettings):
     # collects more than this many DENY_* terminals within the window.
     risk_denial_window_seconds: int = 600
     risk_denial_threshold: int = 3
-    # Auth-failure factor: one gateway-wide counter of failed API-key lookups; fires
-    # for every identity while more than this many failures sit within the window.
-    risk_auth_failure_window_seconds: int = 300
-    risk_auth_failure_threshold: int = 5
     # Drift-history factor: fires when a tool has this many DRIFT_* audit events in
     # the window, even if re-approved ("changed shape twice in the last week").
     risk_drift_history_window_seconds: int = 604800

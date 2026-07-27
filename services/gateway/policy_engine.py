@@ -247,6 +247,34 @@ class PolicyFile(BaseModel):
     risk: RiskPolicy = RiskPolicy()
 
     @model_validator(mode="after")
+    def _check_identity_indexes(self) -> "PolicyFile":
+        seen_ids: dict[str, int] = {}
+        seen_hashes: dict[str, str] = {}
+        seen_key_ids: dict[str, str] = {}
+        for index, identity in enumerate(self.identities):
+            if identity.id in seen_ids:
+                raise ValueError(
+                    f"duplicate identity id {identity.id!r} at identities[{seen_ids[identity.id]}]"
+                    f" and identities[{index}]"
+                )
+            seen_ids[identity.id] = index
+            if identity.api_key_hash:
+                if identity.api_key_hash in seen_hashes:
+                    raise ValueError(
+                        f"duplicate api_key_hash {identity.api_key_hash!r} for identities"
+                        f" {seen_hashes[identity.api_key_hash]!r} and {identity.id!r}"
+                    )
+                seen_hashes[identity.api_key_hash] = identity.id
+            if identity.key_id:
+                if identity.key_id in seen_key_ids:
+                    raise ValueError(
+                        f"duplicate key_id {identity.key_id!r} for identities"
+                        f" {seen_key_ids[identity.key_id]!r} and {identity.id!r}"
+                    )
+                seen_key_ids[identity.key_id] = identity.id
+        return self
+
+    @model_validator(mode="after")
     def _check_servers(self) -> "PolicyFile":
         if "*" in self.servers:
             raise ValueError('"*" is a grant wildcard, not a registrable server_id')

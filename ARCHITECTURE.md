@@ -158,7 +158,7 @@ graph TD
     Verifier["audit_verifier sidecar (separate process, read-only chain walk)"] --> PG
 ```
 
-Edges elided for readability: Auth bumps the gateway-wide auth-failure counter in Redis on wrong-key attempts; the Interceptor bumps the per-identity denial counter in Redis on every `DENY_*` terminal; the Decision Explainer reads the shared schema cache for dry-run param validation. The verifier sidecar reads only the public signing key — the private key never leaves the gateway process.
+Edges elided for readability: Auth uses a source-scoped Redis failure window before credential verification; the Interceptor bumps the per-identity denial counter in Redis on every `DENY_*` terminal; the Decision Explainer reads the shared schema cache for dry-run param validation. The verifier sidecar reads only the public signing key — the private key never leaves the gateway process.
 
 ### 4.5 Deployment diagrams
 
@@ -341,7 +341,6 @@ Rather than one monolithic scoring function, each signal is implemented as a sma
 - Whether the tool's schema is mid-drift-review (an unresolved `DRIFT_MEDIUM` bumps risk even if calls aren't blocked outright)
 - **Prior denial rate** for this identity over a rolling window — an identity that's been denied repeatedly is a stronger risk signal than one with a clean history
 - **Recent schema drift history** for the target tool, even if already re-approved — a tool that changed shape twice in the last week is inherently riskier than one that's been stable for months
-- **Recent authentication failures** for this identity (a small addition to the Auth Layer: one Redis counter incremented on failed API-key lookups, decayed over a rolling window) — a spike in auth failures just before a successful call is a classic credential-stuffing pattern
 - **Suspicious baseline** (item 36b): the tool's *approved* description text matched the baseline-time content heuristics (instruction-override phrasing, hidden/zero-width unicode, encoded payloads) — a static property of the tool's content, non-decayable like the sensitivity tier, and honest about being a heuristic: it informs risk, it never blocks
 
 **Determinism is a deliberate design choice, not a placeholder for a future ML model.** This project's value proposition is security, determinism, and explainability — a learned model scoring risk would work against all three: it introduces training-data provenance questions, validation burden, and a decision that can't be fully explained by the Decision Explanation feature below. A weighted, rule-based engine isn't a lesser version of a "real" risk engine here — for this problem, it's the correct architecture, and no ML-based scoring is planned.
@@ -398,7 +397,9 @@ runs the same evaluation path *without* actually forwarding the call — useful 
 - **`bearer` (default)** — client presents an API key in a custom header (`X-PortunusMCP-Key`). The key itself is a high-entropy secret (a 32-byte random value, base64-encoded, generated at identity-creation time via `scripts/generate_api_key.py` and shown to the operator exactly once); the policy store never holds the raw key, only `SHA256(key)`. On each request, the gateway hashes the presented key and looks up the resulting hash directly against the stored identity records — a hash-and-lookup, **not** an HMAC or signing scheme. Works with any stock MCP client; the tradeoff is that the credential rides every request, so a captured request is a stolen key.
 - **`signed`** — no secret on the wire at all. The policy holds a *non-secret* `key_id` and the *name* of an environment variable (`signing_secret_env`) the gateway resolves the shared secret from at policy load (fail-closed if unset; secrets never enter the policy file, its revision snapshots, logs, or audit rows). Every request and notification the client sends carries `portunusmcp/key-id` and `portunusmcp/signature` in `params._meta` alongside the nonce/timestamp, where the signature is HMAC-SHA256 over the canonicaljson of `{nonce, timestamp, method, tool, arguments}`. Verification happens at the HTTP edge, before the transport parses the message — any failure is a plain 401. GET (the SSE stream) and DELETE carry no body to sign; they are bound to the session that a signature-verified `initialize` created (residual: possession of a captured session id reads that session's response stream until teardown — see `THREAT_MODEL.md`). `signed` identities cannot be `admin: true` (rejected at load): the `/admin` API authenticates by bearer key only.
 
-A rolling Redis counter tracks failed lookups — wrong bearer keys, unknown key ids, bad signatures — feeding the Risk Engine's auth-failure signal above. No session cookies, no JWTs for v1. OAuth 2.1 On-Behalf-Of token exchange stays a documented later item (this is where you'd map an upstream OAuth token per user identity so the gateway never holds a single shared credential).
+**Source-scoped auth-failure throttling (item 43).** Wrong bearer keys, unknown key ids, and bad signatures share one Redis fixed window per Uvicorn-resolved client IP across MCP and admin authentication (default five failures per five minutes). Uvicorn accepts forwarded client addresses only from `FORWARDED_ALLOW_IPS`; production must configure the actual TLS proxy IP/CIDR. The source address is SHA-256-hashed into `rate:auth_failure:*`, while the first threshold crossing logs the raw IP, auth surface, and retry interval for operator actionability. The sixth failure and every later presented credential — even a valid one — receive HTTP 429 plus `Retry-After` until the original window expires; missing credentials, pre-auth Host/Origin/body rejects, valid credentials that later fail session binding or admin authorization, and signed GET/DELETE on an established session do not count. Redis or source-resolution failure returns HTTP 503. The increment/first-expiry pair is one Redis Lua operation; a concurrent first burst can already be verifying when the threshold crosses, and source rotation or shared NATs remain the explicit ceiling. The old gateway-wide authorization-risk contribution is gone: unauthenticated traffic can no longer raise an unrelated identity's score.
+
+Policy loading also rejects duplicate identity ids, bearer API-key hashes, and signed key ids before constructing the lookup dictionaries. The check is exact and case-sensitive, reports the colliding value/identities (or list positions for duplicate ids), and therefore applies equally to startup, SIGHUP, rollout, rollback, and simulation. No session cookies or JWTs exist in v1. OAuth 2.1 On-Behalf-Of token exchange stays a documented later item.
 
 **Session idle timeout** — clean disconnect and gateway shutdown cover intentional paths; a Redis TTL (`session:{id}:last_seen`, default 5 minutes, refreshed on each request) covers silent clients. While any call is outstanding, a per-session heartbeat refreshes the key every half-TTL; Redis refresh failure tears the session down fail-closed. The heartbeat stops after the final call completes, so a later genuinely idle session expires and is reaped normally.
 
@@ -495,7 +496,7 @@ A security gateway that silently fails open under load or during an outage is wo
 
 | Subsystem unavailable | Behavior | Rationale |
 |---|---|---|
-| Redis (replay guard, rate limiting, cache) | **Fail closed** — rate-check failure returns HTTP 503 before the decision pipeline; replay/cache failure denies | If the gateway cannot enforce the per-identity rate window or check whether a nonce was already seen, silently proceeding would remove a security control during the outage. |
+| Redis (replay guard, rate limiting, cache) | **Fail closed** — tool-call or source-auth rate-check failure returns HTTP 503 before the decision pipeline; replay/cache failure denies | If the gateway cannot enforce either rate window or check whether a nonce was already seen, silently proceeding would remove a security control during the outage. |
 | Postgres (audit log write) | **Fail closed** — deny the call before it reaches the upstream server | An action that can't be recorded is, for this project's purposes, an action that shouldn't happen — "no record, no action" is the defensible posture even though it costs availability. This is a deliberate trade-off, stated as such. |
 | Audit key rotation/promotion incomplete | **Fail closed** after the audited handoff — signing readiness fails and audited actions stop until startup recovery; a pre-handoff stage is discarded | Once the chain commits the new fingerprint, continuing on an ambiguous key would make later verification non-deterministic. |
 | Policy promotion incomplete | **Fail closed** after the audited handoff — policy readiness fails and MCP returns 503 until startup recovery; pre-handoff staging is discarded | The audit row and durable active file must converge on the same policy before traffic resumes. |
@@ -520,6 +521,7 @@ The consistent theme: every subsystem whose failure would silently weaken a secu
 - **Implemented (item 40):** strict body/depth bounds, SDK Host/Origin validation, per-identity session/in-flight quotas, a 60-second call deadline, and a Redis fixed-window `tools/call` limit (default 60 per 60 seconds). The fixed window is deliberately simple and permits up to twice the configured count across two adjacent window boundaries; replace it only if measured abuse requires a sliding window.
 - **Implemented (item 41):** the production Compose profile is explicit and single-replica, publishes only loopback app/monitoring ports, isolates authenticated Postgres/Redis on an internal network, digest-pins service images, separates gateway-only secrets, and applies read-only roots, dropped capabilities, no-new-privileges, resource ceilings, restart policies, and bounded local logs.
 - **Implemented (item 42):** the admin body boundary is 1 MiB; policy/key mutations are serialized, journaled, audited before atomic promotion, and startup-recoverable; historical audit keys are retained by fingerprint; exported ranges are independently verifiable.
+- **Implemented (item 43):** failed credentials are throttled per trusted-proxy-resolved source across MCP/admin, with fail-closed Redis handling and an immediate warning alert; duplicate identity ids, API-key hashes, and key ids fail policy load.
 - Never log full argument payloads for tools flagged as handling secrets (policy field: `redact_args: true` per tool).
 - Bearer API keys are 256-bit random values stored only as deterministic SHA-256 hashes; raw keys are shown once by the operator CLI and never persisted in plaintext.
 - The shipped single-host production profile trusts plaintext traffic inside its isolated backend network; a future multi-host deployment must add authenticated TLS between services.
@@ -535,11 +537,11 @@ The consistent theme: every subsystem whose failure would silently weaken a secu
 
 *Implemented (item 25). Structured logs shipped from day one (item 13); Prometheus/Grafana were added once core gateway logic was stable so effort wasn't split across two problems at once.*
 
-- **Prometheus metrics** (`services/gateway/metrics.py` — exactly this set, no more): `portunusmcp_tool_calls_total{identity, server, tool, decision}` (incremented at the interceptor's three terminal emission points; `decision` = the audit event type; `tool` preserves a name only when it exists in that server's current Redis schema cache, otherwise `other`, including on cache failure), `portunusmcp_schema_drift_total{server, tool, severity}` (Drift Detector classification writes), `portunusmcp_risk_score` (histogram, observed once per freshly scored call whatever the eventual outcome), `portunusmcp_request_latency_seconds` (histogram, decision-pipeline time per `tools/call` — proxy overhead only, the upstream round trip is excluded), `portunusmcp_audit_chain_verify_failures_total` (verifier failure branch — alert on any increase; this replaced item 11/13's `logger.error`-only alerting), `portunusmcp_replay_denied_total`.
+- **Prometheus metrics** (`services/gateway/metrics.py` — exactly this set, no more): `portunusmcp_tool_calls_total{identity, server, tool, decision}` (incremented at the interceptor's three terminal emission points; `decision` = the audit event type; `tool` preserves a name only when it exists in that server's current Redis schema cache, otherwise `other`, including on cache failure), `portunusmcp_schema_drift_total{server, tool, severity}` (Drift Detector classification writes), `portunusmcp_risk_score` (histogram, observed once per freshly scored call whatever the eventual outcome), `portunusmcp_request_latency_seconds` (histogram, decision-pipeline time per `tools/call` — proxy overhead only, the upstream round trip is excluded), `portunusmcp_audit_chain_verify_failures_total` (verifier failure branch), `portunusmcp_replay_denied_total`, and the unlabeled `portunusmcp_auth_throttled_total` (every source-throttled credential attempt). The bundled `PortunusMCPAuthSourceBlocked` warning fires on any five-minute increase in the last counter; notification routing remains operator-managed.
 - **Exposure posture:** unauthenticated but internal-only. Metric labels carry identity ids and tool names, so `/metrics` is never served on the published app port — the gateway starts a separate listener on `METRICS_PORT` (default 9100; the verifier sidecar uses 9101, skipped under `--once`), and neither Compose file publishes those ports. Prometheus scrapes them over the Compose network. Metric increments are in-memory and cannot meaningfully fail — no fail-open/fail-closed posture applies.
 - **Prometheus + Grafana containers:** both explicit Compose files have an opt-in `monitoring` profile. Demo publishes anonymous local Grafana; production binds both UIs to loopback, requires a Grafana login, persists their state, and applies the production hardening/limits.
 - **Grafana dashboard** (`monitoring/grafana/dashboards/portunusmcp.json`, provisioned automatically): panels for allow/deny/challenge rate over time, top denied tools, drift events timeline by severity, risk score distribution, p50/p95/p99 pipeline latency.
-- **Structured logs (structlog, JSON):** one line per decision, correlation ID = session ID, shippable to any log aggregator. Shipped in MVP regardless of the Prometheus/Grafana timeline.
+- **Structured logs (structlog, JSON):** one line per decision, correlation ID = session ID, shippable to any log aggregator. The first auth-throttle crossing additionally logs raw source IP, `mcp|admin` surface, and retry interval, never credential material.
 
 ---
 
@@ -575,18 +577,18 @@ It also measures the **`tools/list` response size reduction** from schema prunin
 
 ### Results
 
-Measured **2026-07-27** from the item-40 working tree based on **`d12ddb2`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, Postgres 16, Redis 7, and local Docker. Latencies are mean / p50 / p95 / p99.
+Measured **2026-07-27** from the item-43 working tree based on **`98e4a80`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, Postgres 16, Redis 7, and local Docker. Latencies are mean / p50 / p95 / p99.
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 0.28 / 0.22 / 0.54 / 1.11 ms | 16.75 / 16.18 / 18.12 / 31.53 ms | 16.47 / 15.95 / 17.58 / 30.42 ms |
-| Single call, cold schema cache | 0.28 / 0.22 / 0.54 / 1.11 ms | 19.57 / 18.93 / 21.86 / 44.81 ms | — |
-| 10 concurrent sessions (p95) | — | 145.98 ms | — |
-| 50 concurrent sessions (p95) | — | 761.38 ms | — |
-| 100 concurrent sessions (p95) | — | 2090.04 ms | — |
+| Single call, cached schema | 0.25 / 0.21 / 0.43 / 0.59 ms | 16.17 / 15.59 / 18.29 / 31.35 ms | 15.93 / 15.38 / 17.85 / 30.76 ms |
+| Single call, cold schema cache | 0.25 / 0.21 / 0.43 / 0.59 ms | 22.14 / 19.26 / 34.01 / 72.71 ms | — |
+| 10 concurrent sessions (p95) | — | 229.20 ms | — |
+| 50 concurrent sessions (p95) | — | 1171.36 ms | — |
+| 100 concurrent sessions (p95) | — | 5376.84 ms | — |
 | `tools/list` payload size (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
 
-Container initialization: first 544.45 ms; next 20 p50 442.97 ms / p95 868.89 ms. Peak RSS after the 100-session run: 212 MiB (gateway and harness share the process); aggregate initialized upstream-container memory: 1,095 MiB. High-concurrency p95 includes Docker container ownership plus synchronous fail-closed audit writes contending on the Postgres pool.
+Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms. Peak RSS after the 100-session run: 153 MiB (gateway and harness share the process); aggregate initialized upstream-container memory: 1,095 MiB. High-concurrency p95 includes Docker container ownership plus synchronous fail-closed audit writes contending on the Postgres pool.
 
 These numbers are published in the README with the exact commit and date they were measured at, so a stale claim is visible as stale rather than quietly wrong.
 
@@ -614,8 +616,8 @@ None of this is built or load-tested at those scales for v1 — it's written her
 
 ## 11. Testing Strategy
 
-- **Unit:** policy resolution logic (RBAC + ABAC condition evaluation), schema hashing and diff classification, risk scoring function, param validator edge cases (nested objects, arrays, unicode).
-- **Integration:** spin up the gateway + a real (mock) MCP server in Compose, drive full `initialize → tools/list → tools/call` sequences via the actual MCP client SDK.
+- **Unit:** policy resolution logic (RBAC + ABAC condition evaluation), duplicate identity/index rejection, schema hashing and diff classification, risk scoring function, param validator edge cases (nested objects, arrays, unicode).
+- **Integration:** spin up the gateway + a real (mock) MCP server in Compose, drive full `initialize → tools/list → tools/call` sequences via the actual MCP client SDK; prove failed credentials throttle only their resolved source and leave a victim source's live risk unchanged.
 - **Production Compose:** render the digest-only production contract, then use local-image test overrides to boot its core + monitoring services, assert isolation/hardening, and drive `initialize → tools/list → tools/call` through the real per-session container runtime.
 - **Operator lifecycle:** live tests cover approval/baseline list-detail-approve, policy validate/simulate/rollout/rollback, old-key-signed rotation, multi-key export verification, the installed CLI as a subprocess, and journal recovery boundaries.
 - **Resource/lifecycle:** `tests/integration/test_resource_limits.py` uses a tiny async sleep tool to cover declared and streamed body limits, JSON depth/encoding/model validation, SDK Host/Origin checks, session/in-flight/rate boundaries and failure semantics, deadline reaping, and in-flight idle heartbeats. `tests/unit/test_readiness.py` covers named dependency/signing failures and the one overall readiness deadline; metrics tests prove arbitrary denied names collapse to `tool="other"`.
@@ -657,7 +659,7 @@ jobs:
 ## 13. Deployment
 
 - **Demo:** `compose.demo.yml` is explicitly unsafe and local-only: default credentials, published data ports, rogue mutation service, tag-pinned images, and optional anonymous monitoring.
-- **Production:** `compose.prod.yml` is the one supported self-hosted deployment: a hardened single-replica gateway/verifier plus local Postgres/Redis, one-shot migrations, digest-pinned images, writable operator-owned policy/audit-key roots, internal data networking, and optional secured monitoring. The verifier sees only the public keyring. TLS termination, backups, host hardening, and log shipping are operator responsibilities.
+- **Production:** `compose.prod.yml` is the one supported self-hosted deployment: a hardened single-replica gateway/verifier plus local Postgres/Redis, one-shot migrations, digest-pinned images, writable operator-owned policy/audit-key roots, internal data networking, and optional secured monitoring. The verifier sees only the public keyring. TLS termination, backups, host hardening, log shipping, and an explicit Uvicorn `FORWARDED_ALLOW_IPS` value matching the TLS proxy are operator responsibilities.
 - **Not built:** Terraform/ECS, remote network upstreams, inter-service mTLS, and multi-replica gateway coordination. Multiple replicas are unsafe until session/container ownership is externalized and the audit chain has a distributed atomic writer. Kubernetes remains deliberately out of v1 (ADR-005).
 
 ---

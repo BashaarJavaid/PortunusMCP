@@ -107,6 +107,7 @@ The full version, including the assumptions the whole model rests on, is in [`TH
 | Compromised registered upstream reading gateway secrets | **Yes (scoped)** | Per-session hardened containers receive a minimal allowlisted environment and no gateway secrets directory, Docker socket, or DB/Redis credentials; host/gateway compromise remains out of scope |
 | DNS rebinding against Streamable HTTP | **Yes (scoped)** | The MCP SDK validates every `/mcp/*` Host and supplied Origin against configured allowlists before auth or parsing; the deployment must configure its real public names |
 | Authenticated resource exhaustion / stuck tools | **Partial** | Per-identity sessions, in-flight calls, fixed-window rate limits, bounded bodies/depth, and a 60s call deadline cap one identity; many identities can still exhaust the host, and a deadline cannot undo an upstream side effect already started |
+| Unauthenticated credential stuffing / auth-path availability | **Partial** | Bad bearer/signed credentials are fixed-window throttled by trusted-proxy-resolved source across MCP/admin and raise an alert; address rotation, initial concurrent bursts, and shared-NAT collateral remain |
 | Prompt injection via tool *results* | Partial | A protocol-layer gateway can log and rate-limit but not semantically evaluate result content — client/agent-framework responsibility |
 | Stolen API key | Partial | Behavioral risk factors reduce blast radius; a key alone can't be distinguished from its holder. A `signed` identity's secret never appears on the wire at all — stealing it means compromising a host environment |
 | Compromised gateway host | No | The attacker has the signing key — an infra hardening problem, not an application one |
@@ -170,7 +171,7 @@ Production now mounts two operator-owned, writable roots into the gateway:
 
 Private files and journals are mode `0600`; archived public keys are `0444`. `.env.prod.gateway` contains only policy-referenced `PORTUNUSMCP_UPSTREAM_*`, signing and TOTP secrets. Postgres and Redis are password-protected and reachable only on the internal data network; neither publishes a host port.
 
-The gateway binds to `127.0.0.1:${GATEWAY_PORT:-8000}`. Put an operator-managed TLS reverse proxy in front of it and set `ALLOWED_HOSTS`/`ALLOWED_ORIGINS` to the real public names. Internal gateway-to-database traffic is plaintext inside the isolated single-host Compose network.
+The gateway binds to `127.0.0.1:${GATEWAY_PORT:-8000}`. Put an operator-managed TLS reverse proxy in front of it, set `ALLOWED_HOSTS`/`ALLOWED_ORIGINS` to the real public names, and set Uvicorn's comma-separated `FORWARDED_ALLOW_IPS` to that proxy's IP/CIDR so source auth throttling cannot trust a client-spoofed address. `*` is appropriate only while this loopback-only trusted-host boundary holds. Internal gateway-to-database traffic is plaintext inside the isolated single-host Compose network.
 
 Optional production monitoring also stays loopback-only and requires a Grafana login:
 
@@ -188,7 +189,7 @@ Do not scale `gateway`: session/container handles are in memory and the audit ch
 {"status":"ready","checks":{"postgres":"ok","redis":"ok","signing":"ok","policy":"ok"}}
 ```
 
-The item-40 settings are environment-backed; all numeric values must be positive, and allowlists are JSON arrays:
+The item-40/43 edge settings are environment-backed; all numeric values must be positive, and allowlists are JSON arrays:
 
 | Setting | Default |
 |---|---:|
@@ -197,6 +198,7 @@ The item-40 settings are environment-backed; all numeric values must be positive
 | `MAX_SESSIONS_PER_IDENTITY` | `3` |
 | `MAX_INFLIGHT_CALLS_PER_IDENTITY` | `5` |
 | `TOOL_CALL_RATE_LIMIT` / `TOOL_CALL_RATE_WINDOW_SECONDS` | `60` / `60` |
+| `AUTH_FAILURE_RATE_LIMIT` / `AUTH_FAILURE_RATE_WINDOW_SECONDS` | `5` / `300` |
 | `TOOL_CALL_DEADLINE_SECONDS` | `60` |
 | `READINESS_TIMEOUT_SECONDS` | `1.0` |
 | `ALLOWED_HOSTS` | `["localhost:*","127.0.0.1:*"]` |
@@ -236,20 +238,20 @@ Approvals and flagged baselines are bounded review queues (100 rows per response
 
 ## Performance
 
-Measured, not estimated, on **2026-07-27** from the item-40 working tree based on **`d12ddb2`**, with real per-session Docker upstreams and the full §4.2 pipeline plus item-40 edge/rate/deadline controls active. Methodology, hardware, and reproduction steps: [`ARCHITECTURE.md` §9](./ARCHITECTURE.md#9-performance-benchmarks).
+Measured, not estimated, on **2026-07-27** from the item-43 working tree based on **`98e4a80`**, with real per-session Docker upstreams and the full §4.2 pipeline plus item-40 edge/rate/deadline and item-43 source-auth controls active. Methodology, hardware, and reproduction steps: [`ARCHITECTURE.md` §9](./ARCHITECTURE.md#9-performance-benchmarks).
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 0.28 / 0.22 / 0.54 / 1.11 ms | 16.75 / 16.18 / 18.12 / 31.53 ms | 16.47 / 15.95 / 17.58 / 30.42 ms |
-| Single call, cold schema cache | 0.28 / 0.22 / 0.54 / 1.11 ms | 19.57 / 18.93 / 21.86 / 44.81 ms | — |
-| 10 concurrent sessions (p95) | — | 145.98 ms | — |
-| 50 concurrent sessions (p95) | — | 761.38 ms | — |
-| 100 concurrent sessions (p95) | — | 2090.04 ms | — |
+| Single call, cached schema | 0.25 / 0.21 / 0.43 / 0.59 ms | 16.17 / 15.59 / 18.29 / 31.35 ms | 15.93 / 15.38 / 17.85 / 30.76 ms |
+| Single call, cold schema cache | 0.25 / 0.21 / 0.43 / 0.59 ms | 22.14 / 19.26 / 34.01 / 72.71 ms | — |
+| 10 concurrent sessions (p95) | — | 229.20 ms | — |
+| 50 concurrent sessions (p95) | — | 1171.36 ms | — |
+| 100 concurrent sessions (p95) | — | 5376.84 ms | — |
 | `tools/list` payload (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
 
 Latencies are mean / p50 / p95 / p99. The high-concurrency p95 includes one hardened Docker container per session as well as the synchronous fail-closed audit write; both are known ceilings, discussed in `ARCHITECTURE.md` §10.
 
-Container initialization: first 544.45 ms; next 20 p50 442.97 ms / p95 868.89 ms. Peak RSS after the 100-session run was 212 MiB (gateway + harness); initialized upstream containers used 1,095 MiB in aggregate.
+Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms. Peak RSS after the 100-session run was 153 MiB (gateway + harness); initialized upstream containers used 1,095 MiB in aggregate.
 
 ---
 
@@ -277,7 +279,7 @@ Container initialization: first 544.45 ms; next 20 p50 442.97 ms / p95 868.89 ms
 
 ## Roadmap
 
-Phases 1–5 are complete. **Phase 6 is making the adopted gateway honestly self-hostable.** Items 39–42 provide the upstream isolation boundary, bounded lifecycles/readiness, explicit demo/production profiles, and the operator CLI/API. Item 43 is next.
+Phases 1–6 are complete. Phase 6 added the upstream isolation boundary, bounded lifecycles/readiness, explicit demo/production profiles, the operator CLI/API, source-scoped authentication throttling, and fail-closed duplicate identity/index validation.
 
 Each item in [`ROADMAP.md`](./ROADMAP.md) states the check that proves it done and the threat-model row it upgrades — **an item is finished when that row can be honestly rewritten, not when the code merges.**
 
