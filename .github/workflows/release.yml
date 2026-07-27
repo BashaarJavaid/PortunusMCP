@@ -244,6 +244,7 @@ jobs:
           sudo apt-get install --yes \
             "moby-engine=$DOCKER_ENGINE_VERSION" \
             "moby-cli=$DOCKER_ENGINE_VERSION"
+          sudo systemctl restart docker
           test "$(docker version --format '{{.Server.Version}}')" = "29.6.2"
           sudo mkdir -p /usr/local/lib/docker/cli-plugins
           sudo curl -fsSL \
@@ -296,6 +297,7 @@ jobs:
           sudo apt-get install --yes \
             "moby-engine=$DOCKER_ENGINE_VERSION" \
             "moby-cli=$DOCKER_ENGINE_VERSION"
+          sudo systemctl restart docker
           test "$(docker version --format '{{.Server.Version}}')" = "29.6.2"
           sudo mkdir -p /usr/local/lib/docker/cli-plugins
           sudo curl -fsSL \
