@@ -20,7 +20,7 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/bashaarjavaid/portunusmcp
-  DOCKER_ENGINE_VERSION: 5:29.6.2-1~ubuntu.24.04~noble
+  DOCKER_ENGINE_VERSION: 29.6.2-ubuntu24.04u1
   COMPOSE_VERSION: v5.3.1
   RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
@@ -242,8 +242,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            "docker-ce=$DOCKER_ENGINE_VERSION" \
-            "docker-ce-cli=$DOCKER_ENGINE_VERSION"
+            "moby-engine=$DOCKER_ENGINE_VERSION" \
+            "moby-cli=$DOCKER_ENGINE_VERSION"
           test "$(docker version --format '{{.Server.Version}}')" = "29.6.2"
           sudo mkdir -p /usr/local/lib/docker/cli-plugins
           sudo curl -fsSL \
@@ -294,8 +294,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            "docker-ce=$DOCKER_ENGINE_VERSION" \
-            "docker-ce-cli=$DOCKER_ENGINE_VERSION"
+            "moby-engine=$DOCKER_ENGINE_VERSION" \
+            "moby-cli=$DOCKER_ENGINE_VERSION"
           test "$(docker version --format '{{.Server.Version}}')" = "29.6.2"
           sudo mkdir -p /usr/local/lib/docker/cli-plugins
           sudo curl -fsSL \
