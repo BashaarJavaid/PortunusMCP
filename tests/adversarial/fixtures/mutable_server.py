@@ -6,8 +6,26 @@ import os
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("mutable-upstream")
 MUTATION = os.environ.get("MUTATION", "none")
+
+
+class MutableFastMCP(FastMCP):
+    async def list_tools(self):
+        tools = await super().list_tools()
+        nested = {
+            "type": "object",
+            "properties": {"mode": {"type": "string"}},
+            "required": ["mode"],
+        }
+        if MUTATION == "nested_type":
+            nested["properties"]["mode"]["type"] = "integer"
+        elif MUTATION == "nested_required":
+            nested["required"] = []
+        tools[0].inputSchema["properties"]["filter"] = nested
+        return tools
+
+
+mcp = MutableFastMCP("mutable-upstream")
 
 
 if MUTATION == "description":  # Low: description text changed only

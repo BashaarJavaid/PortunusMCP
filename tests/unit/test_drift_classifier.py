@@ -1,6 +1,8 @@
 """Severity classification per the ARCHITECTURE.md §4.8 drift table, the item-36b
 description-content heuristics, plus the spec-mandated canonicalization guard."""
 
+from copy import deepcopy
+
 import canonicaljson
 import pytest
 
@@ -14,6 +16,32 @@ BASE = {
         "type": "object",
         "properties": {"to": {"type": "string"}, "subject": {"type": "string"}},
         "required": ["to", "subject"],
+    },
+}
+
+NESTED_BASE = {
+    "name": "search_email",
+    "description": "Search email.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "filter": {
+                "type": "object",
+                "description": "Search filters.",
+                "properties": {
+                    "mode": {"type": "string"},
+                    "rules": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"action": {"type": "string"}},
+                            "required": ["action"],
+                        },
+                    },
+                },
+                "required": ["mode"],
+            }
+        },
     },
 }
 
@@ -93,6 +121,68 @@ def test_unclassifiable_change_fails_closed_as_high() -> None:
     changed = variant()
     changed["inputSchema"]["additionalProperties"] = True  # not a named table row
     assert classify(BASE, changed) is DriftSeverity.HIGH
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("optional_added", DriftSeverity.MEDIUM),
+        ("required_added", DriftSeverity.CRITICAL),
+        ("removed", DriftSeverity.HIGH),
+        ("type_changed", DriftSeverity.CRITICAL),
+        ("required_flipped", DriftSeverity.CRITICAL),
+    ],
+)
+def test_nested_properties_use_the_same_severity_rules(
+    mutation: str, expected: DriftSeverity
+) -> None:
+    changed = deepcopy(NESTED_BASE)
+    nested = changed["inputSchema"]["properties"]["filter"]
+    if mutation in {"optional_added", "required_added"}:
+        nested["properties"]["tag"] = {"type": "string"}
+        if mutation == "required_added":
+            nested["required"].append("tag")
+    elif mutation == "removed":
+        del nested["properties"]["mode"]
+        nested["required"].remove("mode")
+    elif mutation == "type_changed":
+        nested["properties"]["mode"]["type"] = "integer"
+    else:
+        nested["required"].remove("mode")
+    assert classify(NESTED_BASE, changed) is expected
+
+
+def test_root_schema_type_change_is_critical() -> None:
+    changed = deepcopy(NESTED_BASE)
+    changed["inputSchema"]["type"] = "array"
+    assert classify(NESTED_BASE, changed) is DriftSeverity.CRITICAL
+
+
+def test_recursive_array_item_type_change_is_critical() -> None:
+    changed = deepcopy(NESTED_BASE)
+    changed["inputSchema"]["properties"]["filter"]["properties"]["rules"]["items"]["properties"][
+        "action"
+    ]["type"] = "integer"
+    assert classify(NESTED_BASE, changed) is DriftSeverity.CRITICAL
+
+
+def test_nested_description_only_change_stays_low() -> None:
+    changed = deepcopy(NESTED_BASE)
+    changed["inputSchema"]["properties"]["filter"]["description"] = "Updated filters."
+    assert classify(NESTED_BASE, changed) is DriftSeverity.LOW
+
+
+def test_unclassifiable_nested_change_fails_closed_as_high() -> None:
+    changed = deepcopy(NESTED_BASE)
+    changed["inputSchema"]["properties"]["filter"]["properties"]["mode"]["enum"] = ["exact"]
+    assert classify(NESTED_BASE, changed) is DriftSeverity.HIGH
+
+
+def test_known_nonblocking_change_does_not_mask_unknown_top_level_drift() -> None:
+    changed = deepcopy(NESTED_BASE)
+    changed["inputSchema"]["properties"]["page"] = {"type": "integer"}
+    changed["annotations"] = {"readOnlyHint": True}
+    assert classify(NESTED_BASE, changed) is DriftSeverity.HIGH
 
 
 # --- item 36b: baseline-time description heuristics ---

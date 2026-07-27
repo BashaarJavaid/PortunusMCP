@@ -326,6 +326,8 @@ Conditions are parsed once at policy load into a small AST (a hand-rolled boolea
 | A field's `required` status changed, or a type changed | Critical | Log `DRIFT_CRITICAL`, block immediately |
 | Tool renamed (a same-shaped tool appears under a new name, or vice versa) | Critical | Log `DRIFT_CRITICAL`, block immediately, treat as a new unapproved tool |
 
+These named rules apply at the root schema and recursively through `properties` and object-valued `items`; any change under another schema keyword is unclassifiable drift and fails closed as High.
+
 Re-approval is a simple admin-API endpoint: `POST /admin/tools/{server_id}/{tool_name}/approve`, which snapshots the new schema as the accepted baseline and logs an `APPROVE` event. This severity model — not the earlier binary block — is the actual "rug pull" defense; it's what makes the feature usable in practice instead of something operators disable the first time a harmless description edit blocks their pipeline.
 
 **Parameter Validator** — before forwarding a `tools/call`, validates `arguments` against the tool's cached `input_schema` using `jsonschema`, rejects unknown/extra fields (strict mode), and strips common injection patterns from string fields (path traversal sequences, null bytes, control characters). This is defense-in-depth, not a replacement for the upstream server's own validation.
