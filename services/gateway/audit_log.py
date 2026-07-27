@@ -72,6 +72,9 @@ class AuditWriter:
         self._signing_key = signing_key
         self._key_id = key_id or signing.key_id(signing_key.public_key())
         self._available = True
+        # Startup or a failed pointer write forces one Postgres source-of-truth read
+        # before the Redis cache becomes trusted again.
+        self._pointer_dirty = True
         # Serializes chain writes so seq order matches chain order. Sufficient for the
         # single-instance Phase 1 deployment; multi-replica write ordering is the
         # documented §10 concern, deferred with the rest of the scaling story.
@@ -138,7 +141,18 @@ class AuditWriter:
                     )
                     pipe.multi()  # type: ignore[no-untyped-call]  # redis-py lacks a stub here
                     await pipe.set(POINTER_KEY, curr_hash)
-                    await pipe.execute()
+                    try:
+                        await pipe.execute()
+                    except WatchError:
+                        continue
+                    except Exception:
+                        self._pointer_dirty = True
+                        try:
+                            await self._redis.delete(POINTER_KEY)
+                        except Exception:
+                            logger.exception("audit_pointer_invalidation_failed")
+                        raise
+                    self._pointer_dirty = False
                     return seq
                 except WatchError:
                     continue
@@ -186,9 +200,10 @@ class AuditWriter:
         return self._available
 
     async def _prev_hash(self, pipe: "aioredis.client.Pipeline") -> str:
-        cached: bytes | None = await pipe.get(POINTER_KEY)
-        if cached is not None:
-            return cached.decode()
+        if not self._pointer_dirty:
+            cached: bytes | None = await pipe.get(POINTER_KEY)
+            if cached is not None:
+                return cached.decode()
         # Cold start / evicted pointer: the one-off slow path §4.8 keeps off the hot path.
         async with self._sessions() as session:
             result = await session.execute(
