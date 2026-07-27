@@ -266,7 +266,7 @@ jobs:
         run: |
           docker logout ghcr.io || true
           docker pull "$PORTUNUSMCP_RELEASE_IMAGE"
-          pytest tests/integration/test_release_artifacts.py -q
+          python -m pytest tests/integration/test_release_artifacts.py -q
 
   upgrade:
     needs: [prepare, build-release]
@@ -321,7 +321,7 @@ jobs:
           PORTUNUSMCP_RELEASE_ROOT: ${{ github.workspace }}/portunusmcp-v${{ needs.prepare.outputs.version }}
           PORTUNUSMCP_RELEASE_IMAGE: ${{ env.IMAGE }}@${{ needs.build-release.outputs.gateway_digest }}
           PORTUNUSMCP_UPGRADE_FROM_IMAGE: portunusmcp:${{ matrix.name }}
-        run: pytest tests/integration/test_release_artifacts.py -q
+        run: python -m pytest tests/integration/test_release_artifacts.py -q
 
   publish-pypi:
     needs: [prepare, smoke, upgrade]
