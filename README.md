@@ -328,9 +328,9 @@ Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms
 
 ## Roadmap
 
-Phases 1–6 are complete. Phase 6 added the upstream isolation boundary, bounded lifecycles/readiness, explicit demo/production profiles, the operator CLI/API, source-scoped authentication throttling, and fail-closed duplicate identity/index validation.
+Phases 1–6 are complete. The Phase 7 blockers (items 44–47) are also complete: [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 48, `portunusmcp quickstart`, is next.
 
-Each item in [`ROADMAP.md`](./ROADMAP.md) states the check that proves it done and the threat-model row it upgrades — **an item is finished when that row can be honestly rewritten, not when the code merges.**
+Items through Phase 6 are complete only when their verification passes and the corresponding threat-model claim is earned. Phase 7 does not upgrade threat-model rows; its adoption items verify against observed friction and the phase closes after five outside users complete `quickstart` and their friction is triaged.
 
 ## License
 
