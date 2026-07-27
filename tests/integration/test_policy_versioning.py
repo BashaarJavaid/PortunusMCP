@@ -11,6 +11,7 @@ import signal
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -18,9 +19,17 @@ import yaml
 from mcp import McpError
 from sqlalchemy import select
 
+from services.gateway import upstream_client
 from services.gateway.config import settings
 from services.gateway.db import AuditLog, PolicyVersion, async_session
-from tests.integration.conftest import ECHO_SERVER, Gateway, _key_hash, running_gateway
+from services.gateway.main import app
+from tests.integration.conftest import (
+    ECHO_SERVER,
+    Gateway,
+    _key_hash,
+    running_gateway,
+    server_spec,
+)
 from tests.integration.test_cache_invalidation import sighup_and_wait_for_activation
 from tests.integration.test_policy_scoping import connect
 
@@ -28,7 +37,7 @@ from tests.integration.test_policy_scoping import connect
 def _policy(keys: dict[str, str], version: int = 1, agent_tools: list[str] | None = None) -> dict:
     return {
         "version": version,
-        "servers": {"default": f"{sys.executable} {ECHO_SERVER}"},
+        "servers": {"default": server_spec(f"{sys.executable} {ECHO_SERVER}")},
         "identities": [
             {
                 "id": "agent",
@@ -89,7 +98,7 @@ async def test_startup_registers_version_snapshot_row_and_audit(
 
 async def test_sighup_bump_snapshots_and_records(versioned_gateway: Gateway) -> None:
     v2 = yaml.safe_dump(_policy(versioned_gateway.keys, version=2, agent_tools=["echo", "add"]))
-    versioned_gateway.policy_path.write_text(v2)
+    versioned_gateway.policy_path.with_name("policy.next.yaml").write_text(v2)
     await sighup_and_wait_for_activation(2)
 
     assert (Path(settings.policy_revisions_dir) / "v2.yaml").read_text() == v2
@@ -101,7 +110,7 @@ async def test_sighup_bump_snapshots_and_records(versioned_gateway: Gateway) -> 
 
 async def test_same_version_different_content_is_rejected(versioned_gateway: Gateway) -> None:
     original_hash = (await version_rows())[0].content_hash
-    versioned_gateway.policy_path.write_text(
+    versioned_gateway.policy_path.with_name("policy.next.yaml").write_text(
         yaml.safe_dump(_policy(versioned_gateway.keys, version=1, agent_tools=["echo", "add"]))
     )
     os.kill(os.getpid(), signal.SIGHUP)
@@ -117,7 +126,7 @@ async def test_same_version_different_content_is_rejected(versioned_gateway: Gat
 
 async def test_rollback_reactivates_prior_revision(versioned_gateway: Gateway) -> None:
     keys = versioned_gateway.keys
-    versioned_gateway.policy_path.write_text(
+    versioned_gateway.policy_path.with_name("policy.next.yaml").write_text(
         yaml.safe_dump(_policy(keys, version=2, agent_tools=["echo", "add"]))
     )
     await sighup_and_wait_for_activation(2)
@@ -131,7 +140,7 @@ async def test_rollback_reactivates_prior_revision(versioned_gateway: Gateway) -
                 headers={"X-PortunusMCP-Key": keys["ops-admin"]},
             )
         assert response.status_code == 200
-        decision = response.json()
+        decision = response.json()["decision"]
         assert decision["event_type"] == "POLICY_ACTIVATED"
         assert decision["policy_version"] == 1
 
@@ -160,3 +169,26 @@ async def test_rollback_authz_and_missing_version(versioned_gateway: Gateway) ->
             headers={"X-PortunusMCP-Key": versioned_gateway.keys["ops-admin"]},
         )
         assert response.status_code == 404
+
+
+async def test_rollback_rejects_unavailable_runtime(
+    versioned_gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    versioned_gateway.policy_path.with_name("policy.next.yaml").write_text(
+        yaml.safe_dump(_policy(versioned_gateway.keys, version=2))
+    )
+    await sighup_and_wait_for_activation(2)
+    monkeypatch.setattr(
+        app.state.upstream_runtime,
+        "preflight",
+        AsyncMock(side_effect=upstream_client.RuntimeError("image missing")),
+    )
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{versioned_gateway.url}/admin/policy/rollback/1",
+            headers={"X-PortunusMCP-Key": versioned_gateway.keys["ops-admin"]},
+        )
+
+    assert response.status_code == 409
+    assert app.state.policy_store.engine.version == 2

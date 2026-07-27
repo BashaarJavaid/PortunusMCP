@@ -2,10 +2,17 @@ import hashlib
 import os
 from typing import Any, cast
 
+import pytest
+from prometheus_client import REGISTRY
+
+from services.gateway import auth as auth_module
 from services.gateway.auth import (
-    AUTH_FAILURE_KEY,
     KEY_ID_META_KEY,
     SIGNATURE_META_KEY,
+    AuthLimiterUnavailable,
+    AuthRateLimited,
+    _failure_key,
+    client_source,
     resolve_identity,
     resolve_identity_tracked,
     sign_request,
@@ -51,50 +58,115 @@ def test_missing_key_resolves_to_none() -> None:
 
 
 class FakeRedis:
-    """INCR/EXPIRE recorder for the auth-failure counter (item 18)."""
+    """Small recorder for item 43's Redis limiter script."""
 
     def __init__(self, error: Exception | None = None) -> None:
         self.counts: dict[str, int] = {}
-        self.expires: dict[str, int] = {}
+        self.ttls: dict[str, int] = {}
         self.error = error
 
-    async def incr(self, key: str) -> int:
+    def _raise(self) -> None:
         if self.error is not None:
             raise self.error
+
+    async def get(self, key: str) -> int | None:
+        self._raise()
+        return self.counts.get(key)
+
+    async def ttl(self, key: str) -> int:
+        self._raise()
+        return self.ttls.get(key, -2)
+
+    async def eval(self, script: str, numkeys: int, key: str, window: str) -> list[int]:
+        self._raise()
+        assert script and numkeys == 1
         self.counts[key] = self.counts.get(key, 0) + 1
-        return self.counts[key]
-
-    async def expire(self, key: str, seconds: int) -> None:
-        self.expires[key] = seconds
+        self.ttls.setdefault(key, int(window))
+        return [self.counts[key], self.ttls[key]]
 
 
-async def test_wrong_key_increments_the_failure_counter() -> None:
+async def test_wrong_key_increments_the_source_failure_counter() -> None:
     redis = FakeRedis()
-    assert await resolve_identity_tracked("not-a-key", ENGINE, cast(Any, redis)) is None
-    assert await resolve_identity_tracked("not-a-key", ENGINE, cast(Any, redis)) is None
-    assert redis.counts == {AUTH_FAILURE_KEY: 2}
-    assert AUTH_FAILURE_KEY in redis.expires  # rolling window set on first failure
+    for _ in range(2):
+        assert (
+            await resolve_identity_tracked(
+                "not-a-key", ENGINE, cast(Any, redis), "192.0.2.1", "mcp"
+            )
+            is None
+        )
+    key = _failure_key("192.0.2.1")
+    assert redis.counts == {key: 2}
+    assert redis.ttls[key] > 0
 
 
 async def test_missing_key_is_not_a_stuffing_signal() -> None:
     redis = FakeRedis()
-    assert await resolve_identity_tracked(None, ENGINE, cast(Any, redis)) is None
-    assert await resolve_identity_tracked("", ENGINE, cast(Any, redis)) is None
+    assert await resolve_identity_tracked(None, ENGINE, cast(Any, redis), None, "mcp") is None
+    assert await resolve_identity_tracked("", ENGINE, cast(Any, redis), None, "mcp") is None
     assert redis.counts == {}
 
 
 async def test_valid_key_does_not_increment() -> None:
     redis = FakeRedis()
-    assert await resolve_identity_tracked(KEY_A, ENGINE, cast(Any, redis)) == "agent-a"
+    assert (
+        await resolve_identity_tracked(KEY_A, ENGINE, cast(Any, redis), "192.0.2.1", "admin")
+        == "agent-a"
+    )
     assert redis.counts == {}
 
 
-async def test_redis_failure_still_produces_the_401_path() -> None:
-    # Counting is telemetry: Redis down must yield None (→ 401), never a 500.
+async def test_redis_failure_and_missing_source_fail_closed() -> None:
     redis = FakeRedis(error=ConnectionError("redis down"))
-    assert await resolve_identity_tracked("not-a-key", ENGINE, cast(Any, redis)) is None
-    # And a valid key still resolves.
-    assert await resolve_identity_tracked(KEY_A, ENGINE, cast(Any, redis)) == "agent-a"
+    with pytest.raises(AuthLimiterUnavailable):
+        await resolve_identity_tracked("not-a-key", ENGINE, cast(Any, redis), "192.0.2.1", "mcp")
+    with pytest.raises(AuthLimiterUnavailable):
+        await resolve_identity_tracked(KEY_A, ENGINE, cast(Any, FakeRedis()), None, "mcp")
+
+
+async def test_sixth_failure_blocks_without_extending_or_resetting_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LogRecorder:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def warning(self, event: str, **fields: object) -> None:
+            self.events.append((event, fields))
+
+    log = LogRecorder()
+    monkeypatch.setattr(auth_module, "logger", log)
+    redis = FakeRedis()
+    source = "2001:db8::1"
+    before = REGISTRY.get_sample_value("portunusmcp_auth_throttled_total") or 0
+    for _ in range(5):
+        assert (
+            await resolve_identity_tracked("not-a-key", ENGINE, cast(Any, redis), source, "mcp")
+            is None
+        )
+    with pytest.raises(AuthRateLimited) as excinfo:
+        await resolve_identity_tracked("not-a-key", ENGINE, cast(Any, redis), source, "mcp")
+    assert excinfo.value.retry_after == redis.ttls[_failure_key(source)]
+    assert log.events == [
+        (
+            "auth_source_throttled",
+            {
+                "source": source,
+                "surface": "mcp",
+                "retry_after_seconds": redis.ttls[_failure_key(source)],
+            },
+        )
+    ]
+    count = redis.counts[_failure_key(source)]
+    with pytest.raises(AuthRateLimited):
+        await resolve_identity_tracked(KEY_A, ENGINE, cast(Any, redis), source, "admin")
+    assert redis.counts[_failure_key(source)] == count
+    assert len(log.events) == 1
+    assert REGISTRY.get_sample_value("portunusmcp_auth_throttled_total") == before + 2
+
+
+def test_client_source_uses_resolved_ip_without_port() -> None:
+    assert client_source({"client": ("2001:db8::1", 4321)}) == "2001:db8::1"
+    assert client_source({"client": None}) is None
 
 
 # --- signed mode (item 34) ---
@@ -194,12 +266,20 @@ def test_missing_nonce_or_signature_fails() -> None:
 async def test_bad_signature_increments_the_failure_counter() -> None:
     redis = FakeRedis()
     message = signed_call(secret="guessed")
-    assert await verify_signed_request_tracked(message, signed_engine(), cast(Any, redis)) is None
-    assert redis.counts == {AUTH_FAILURE_KEY: 1}
+    assert (
+        await verify_signed_request_tracked(
+            message, signed_engine(), cast(Any, redis), "192.0.2.2", "mcp"
+        )
+        is None
+    )
+    assert redis.counts == {_failure_key("192.0.2.2"): 1}
 
 
 async def test_no_key_material_is_not_a_stuffing_signal() -> None:
     redis = FakeRedis()
     message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo"}}
-    assert await verify_signed_request_tracked(message, signed_engine(), cast(Any, redis)) is None
+    assert (
+        await verify_signed_request_tracked(message, signed_engine(), cast(Any, redis), None, "mcp")
+        is None
+    )
     assert redis.counts == {}

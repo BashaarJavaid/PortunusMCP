@@ -10,6 +10,7 @@ from mcp import ClientSession, McpError
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import TextContent
 
+from services.gateway.main import app
 from tests.integration.conftest import Gateway
 
 
@@ -57,14 +58,35 @@ async def test_full_identity_sees_and_calls_everything(gateway: Gateway) -> None
 
 async def test_missing_key_is_401(gateway: Gateway) -> None:
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{gateway.url}/mcp/", json={})
+        response = await client.post(
+            f"{gateway.url}/mcp/", json={"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        )
         assert response.status_code == 401
 
 
 async def test_wrong_key_is_401(gateway: Gateway) -> None:
     async with httpx.AsyncClient(headers={"X-PortunusMCP-Key": "not-a-real-key"}) as client:
-        response = await client.post(f"{gateway.url}/mcp/", json={})
+        response = await client.post(
+            f"{gateway.url}/mcp/", json={"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        )
         assert response.status_code == 401
+
+
+async def test_auth_limiter_failure_is_503(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class UnavailableRedis:
+        async def get(self, key: str) -> None:
+            raise ConnectionError(key)
+
+    monkeypatch.setattr(app.state, "redis", UnavailableRedis())
+    async with httpx.AsyncClient(
+        headers={"X-PortunusMCP-Key": gateway.keys["agent-readonly"]}
+    ) as client:
+        response = await client.post(
+            f"{gateway.url}/mcp/", json={"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        )
+    assert (response.status_code, response.text) == (503, "authentication limiter unavailable")
 
 
 async def test_valid_key_cannot_ride_another_identitys_session(gateway: Gateway) -> None:

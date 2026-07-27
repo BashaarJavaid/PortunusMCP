@@ -5,7 +5,9 @@ ENGINE = PolicyEngine(
     PolicyFile.model_validate(
         {
             "version": 1,
-            "servers": {"default": "unused-command"},
+            "servers": {
+                "default": {"image": "example/upstream:test", "command": ["unused-command"]}
+            },
             "identities": [
                 {
                     "id": "agent-readonly",

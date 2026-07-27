@@ -280,6 +280,22 @@ async def simulate_historical(
     return summarize_historical(pairs)
 
 
+async def simulate_candidate(
+    engine: PolicyEngine,
+    replay_window: str,
+    *,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    detector: DriftDetector,
+    risk: RiskEngine,
+    schema_cache: SchemaCache,
+) -> HistoricalSimulation:
+    """Replay an unrecorded, unactivated candidate policy."""
+    start, end = parse_window(replay_window)
+    rows = await replay_rows(start, end, sessionmaker)
+    pairs = [(row, await _simulate_row(row, engine, detector, risk, schema_cache)) for row in rows]
+    return summarize_historical(pairs)
+
+
 async def simulate_compare(
     versions: list[int],
     replay_window: str,

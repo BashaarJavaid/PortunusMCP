@@ -21,6 +21,9 @@ dependencies = [
     "structlog==26.1.0",
 ]
 
+[project.scripts]
+portunusmcp = "services.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest==8.3.4",

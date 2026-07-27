@@ -3,6 +3,8 @@ hook points, are served on the internal metrics listener, and are absent from th
 published app port."""
 
 import httpx
+import pytest
+from mcp import McpError
 from prometheus_client import REGISTRY
 
 from services.gateway import signing
@@ -13,6 +15,7 @@ from services.gateway.main import app
 from tests.integration.conftest import Gateway
 from tests.integration.test_audit_log import drive_session
 from tests.integration.test_audit_verifier import forge_chain_from
+from tests.integration.test_policy_scoping import connect
 
 
 def sample(name: str, labels: dict[str, str] | None = None) -> float:
@@ -71,3 +74,23 @@ async def test_verify_failure_increments_counter(gateway: Gateway) -> None:
     _, failure = await verify_increment(async_session, public_key)
     assert failure is not None
     assert sample("portunusmcp_audit_chain_verify_failures_total") == before + 1
+
+
+async def test_unknown_tool_names_share_one_bounded_label(gateway: Gateway) -> None:
+    labels = {
+        "identity": "agent-readonly",
+        "server": "default",
+        "tool": "other",
+        "decision": "DENY_RBAC",
+    }
+    before = sample("portunusmcp_tool_calls_total", labels)
+    names = [f"attacker-name-{i}" for i in range(10)]
+    async with connect(gateway.url, gateway.keys["agent-readonly"]) as session:
+        await session.list_tools()
+        for name in names:
+            with pytest.raises(McpError):
+                await session.call_tool(name, {})
+
+    assert sample("portunusmcp_tool_calls_total", labels) == before + len(names)
+    for name in names:
+        assert sample("portunusmcp_tool_calls_total", {**labels, "tool": name}) == 0

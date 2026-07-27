@@ -31,6 +31,8 @@ class EventType(StrEnum):
     # Item 36b: a newly baselined/promoted schema matched the description-content
     # heuristics — flagged (risk factor), never blocked. Non-decision row.
     BASELINE_FLAGGED = "BASELINE_FLAGGED"
+    # Item 42: old-key-signed handoff to a fingerprint-addressed new audit key.
+    AUDIT_KEY_ROTATED = "AUDIT_KEY_ROTATED"
     POLICY_ACTIVATED = "POLICY_ACTIVATED"
     POLICY_ERROR = "POLICY_ERROR"
 

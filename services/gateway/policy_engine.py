@@ -12,18 +12,24 @@ startup — fail closed (ARCHITECTURE.md §5).
 
 import hashlib
 import os
-from pathlib import Path
+import re
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
+import canonicaljson
 import structlog
 import yaml
-from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from services.gateway import abac, step_up
 
 logger = structlog.get_logger(__name__)
 
 SensitivityTier = Literal["low", "medium", "high", "critical"]
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_UPSTREAM_ENV_PREFIX = "PORTUNUSMCP_UPSTREAM_"
+_VOLUME_PREFIX = "portunusmcp-upstream-"
+_RESERVED_MOUNT_TARGETS = (PurePosixPath("/app/secrets"), PurePosixPath("/var/run/docker.sock"))
 
 
 class RiskPolicy(BaseModel):
@@ -36,6 +42,96 @@ class RiskPolicy(BaseModel):
     tool_sensitivity: dict[str, SensitivityTier] = {}
     # fnmatch patterns matched against every string argument value (repos, paths).
     protected_repos: list[str] = []
+
+
+class UpstreamResources(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_mb: int = Field(default=256, gt=0)
+    cpus: float = Field(default=0.5, gt=0)
+    pids: int = Field(default=64, gt=0)
+
+
+class UpstreamMount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    target: str
+
+    @model_validator(mode="after")
+    def _check_mount(self) -> "UpstreamMount":
+        if not self.source.startswith(_VOLUME_PREFIX) or "," in self.source:
+            raise ValueError(f"volume names must start with {_VOLUME_PREFIX!r}")
+        target = PurePosixPath(self.target)
+        if not target.is_absolute() or "," in self.target:
+            raise ValueError("upstream mount target must be an absolute path without commas")
+        if ".." in target.parts:
+            raise ValueError("upstream mount target must not contain '..'")
+        for reserved in _RESERVED_MOUNT_TARGETS:
+            if target == reserved or reserved in target.parents:
+                raise ValueError(f"upstream mount target {self.target!r} is reserved")
+        return self
+
+
+class UpstreamServer(BaseModel):
+    """Versioned item-39 container launch specification for one upstream server."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image: str = Field(min_length=1)
+    command: list[str] = Field(min_length=1)
+    env: dict[str, str] = {}
+    volumes: list[UpstreamMount] = []
+    network: Literal["none", "bridge"] = "none"
+    resources: UpstreamResources = UpstreamResources()
+    _resolved_environment: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    @field_validator("image")
+    @classmethod
+    def _check_image(cls, value: str) -> str:
+        if "\0" in value or value.strip() != value:
+            raise ValueError("upstream image must not contain NUL or surrounding whitespace")
+        return value
+
+    @field_validator("command")
+    @classmethod
+    def _check_command(cls, value: list[str]) -> list[str]:
+        if any(not part or "\0" in part for part in value):
+            raise ValueError("upstream command argv entries must be non-empty and NUL-free")
+        return value
+
+    @model_validator(mode="after")
+    def _resolve_environment(self) -> "UpstreamServer":
+        resolved: dict[str, str] = {}
+        for destination, source in self.env.items():
+            if not _ENV_NAME.fullmatch(destination):
+                raise ValueError(f"invalid upstream environment name {destination!r}")
+            if not source.startswith(_UPSTREAM_ENV_PREFIX):
+                raise ValueError(
+                    f"upstream environment source {source!r} must start with"
+                    f" {_UPSTREAM_ENV_PREFIX!r}"
+                )
+            value = os.environ.get(source)
+            if value is None:
+                raise ValueError(f"upstream environment source {source!r} is unset")
+            if "\0" in value:
+                raise ValueError(f"upstream environment source {source!r} contains NUL")
+            resolved[destination] = value
+        self._resolved_environment = resolved
+        return self
+
+    @property
+    def resolved_environment(self) -> dict[str, str]:
+        return dict(self._resolved_environment)
+
+    @property
+    def runtime_fingerprint(self) -> str:
+        payload = self.model_dump(mode="json")
+        payload["environment_value_hashes"] = {
+            name: hashlib.sha256(value.encode()).hexdigest()
+            for name, value in sorted(self._resolved_environment.items())
+        }
+        return hashlib.sha256(canonicaljson.encode_canonical_json(payload)).hexdigest()
 
 
 class ServerGrant(BaseModel):
@@ -144,12 +240,39 @@ class PolicyFile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: int
-    # Server registry (item 35): server_id -> stdio spawn command. Clients connect to
-    # /mcp/{server_id}; the command is part of enforcement state, so it lives in the
-    # policy file and is versioned/snapshotted/rolled back with it.
-    servers: dict[str, str] = {}
+    # Server registry (items 35 + 39): server_id -> isolated container specification.
+    # Clients connect to /mcp/{server_id}; launch state is versioned with enforcement.
+    servers: dict[str, UpstreamServer] = {}
     identities: list[Identity] = []
     risk: RiskPolicy = RiskPolicy()
+
+    @model_validator(mode="after")
+    def _check_identity_indexes(self) -> "PolicyFile":
+        seen_ids: dict[str, int] = {}
+        seen_hashes: dict[str, str] = {}
+        seen_key_ids: dict[str, str] = {}
+        for index, identity in enumerate(self.identities):
+            if identity.id in seen_ids:
+                raise ValueError(
+                    f"duplicate identity id {identity.id!r} at identities[{seen_ids[identity.id]}]"
+                    f" and identities[{index}]"
+                )
+            seen_ids[identity.id] = index
+            if identity.api_key_hash:
+                if identity.api_key_hash in seen_hashes:
+                    raise ValueError(
+                        f"duplicate api_key_hash {identity.api_key_hash!r} for identities"
+                        f" {seen_hashes[identity.api_key_hash]!r} and {identity.id!r}"
+                    )
+                seen_hashes[identity.api_key_hash] = identity.id
+            if identity.key_id:
+                if identity.key_id in seen_key_ids:
+                    raise ValueError(
+                        f"duplicate key_id {identity.key_id!r} for identities"
+                        f" {seen_key_ids[identity.key_id]!r} and {identity.id!r}"
+                    )
+                seen_key_ids[identity.key_id] = identity.id
+        return self
 
     @model_validator(mode="after")
     def _check_servers(self) -> "PolicyFile":
@@ -201,7 +324,7 @@ class PolicyEngine:
     def identity(self, identity_id: str) -> Identity | None:
         return self._identities.get(identity_id)
 
-    def server_command(self, server_id: str) -> str | None:
+    def server_config(self, server_id: str) -> UpstreamServer | None:
         return self.policy.servers.get(server_id)
 
     def is_allowed(self, identity_id: str | None, server_id: str, tool_name: str) -> bool:

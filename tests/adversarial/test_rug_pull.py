@@ -127,9 +127,20 @@ async def test_approve_flow_unblocks(drift_gateway: Gateway) -> None:
             response = await client.post(approve_url, headers={"X-PortunusMCP-Key": "nope"})
             assert response.status_code == 401
 
-            response = await client.post(
-                approve_url, headers={"X-PortunusMCP-Key": drift_gateway.keys["admin"]}
+            headers = {"X-PortunusMCP-Key": drift_gateway.keys["admin"]}
+            listing = await client.get(
+                f"{drift_gateway.url}/admin/baselines/flagged", headers=headers
             )
+            assert listing.status_code == 200
+            assert listing.json()["items"][0]["severity"] == "high"
+            detail = await client.get(
+                f"{drift_gateway.url}/admin/baselines/default/send_email",
+                headers=headers,
+            )
+            assert detail.status_code == 200
+            assert detail.json()["observed_schema"] is not None
+
+            response = await client.post(approve_url, headers=headers)
             assert response.status_code == 200
             decision = response.json()
             assert decision["event_type"] == "APPROVED"

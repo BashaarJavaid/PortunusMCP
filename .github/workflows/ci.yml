@@ -58,12 +58,15 @@ jobs:
     env:
       DATABASE_URL: postgresql+asyncpg://portunusmcp:portunusmcp@localhost:5432/portunusmcp
       REDIS_URL: redis://localhost:6379/0
+      UPSTREAM_RUNTIME_NAMESPACE: portunusmcp-ci
+      REQUIRE_DOCKER_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
+      - run: docker build -t portunusmcp:dev .
       # Service containers are up, so the integration/adversarial suites run
       # for real here — the reachability skip in clean_audit must not fire.
       - run: pytest --cov=services --cov-fail-under=80
@@ -98,12 +101,14 @@ jobs:
     env:
       DATABASE_URL: postgresql+asyncpg://portunusmcp:portunusmcp@localhost:5432/portunusmcp
       REDIS_URL: redis://localhost:6379/0
+      UPSTREAM_RUNTIME_NAMESPACE: portunusmcp-benchmark
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
+      - run: docker build -t portunusmcp:dev .
       # N=100 (vs the local default 1000) keeps the job practical on a shared
       # runner; the fixed 10/50/100-session concurrency scenarios are unaffected.
       # Runner numbers track regressions between runs, they don't replace the

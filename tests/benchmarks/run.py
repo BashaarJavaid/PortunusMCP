@@ -1,29 +1,32 @@
-"""Performance benchmark harness (ROADMAP item 12, ARCHITECTURE.md §9).
+"""Performance benchmark harness (ROADMAP items 12 + 39, ARCHITECTURE.md §9).
 
-Measures tools/call latency directly against sample_target/overscoped_server.py (stdio)
-vs. through the full gateway pipeline (replay guard → auth → RBAC → drift → param
-validation → audit write with ECDSA signing), plus concurrent-session p95 and the
-tools/list payload-size reduction from schema pruning. The Risk Engine runs in the
-pipeline but is neutralized (see main()): off-hours and call-frequency factors would
-otherwise push the hammered read_file into the CHALLENGE band and abort the run —
+Measures tools/call latency directly against sample_target/benchmark_server.py (stdio)
+vs. through the full gateway pipeline and a per-session Docker container, plus
+container initialization, concurrent-session p95/memory, and tools/list payload-size
+reduction. The Risk Engine runs in the pipeline but is neutralized (see main()):
 §9 measures pipeline latency, not risk verdicts.
 
 Documented choices (the §9 method leaves these open):
 - timing is time.perf_counter() around MCP client SDK calls, identical on both paths;
 - one in-process gateway (tests/integration/conftest.running_gateway) serves every
-  scenario, including all concurrency levels;
+  scenario; its upstream sessions use the real Docker runtime;
 - "cold schema cache" = Redis DEL of the schema key before each timed call, forcing
   the interceptor's transparent upstream tools/list re-fetch + drift check per call.
 
 Run (postgres + redis must be reachable; wipes the dev audit chain like the tests do):
-    docker compose up -d postgres redis
+    docker compose --env-file .env.demo -f compose.demo.yml up -d postgres redis
+    docker build -t portunusmcp:dev .
+    export UPSTREAM_RUNTIME_NAMESPACE=portunusmcp-benchmark
     .venv/bin/python -m tests.benchmarks.run [N]   # N = calls per scenario, default 1000
 """
 
 import asyncio
 import functools
 import json
+import logging
+import os
 import platform
+import re
 import resource
 import secrets
 import statistics
@@ -53,17 +56,25 @@ from tests.integration.conftest import (
     running_gateway,
 )
 
-OVERSCOPED_SERVER = Path(__file__).parents[2] / "sample_target" / "overscoped_server.py"
+BENCHMARK_SERVER = Path(__file__).parents[2] / "sample_target" / "benchmark_server.py"
 REPORTS_DIR = Path(__file__).parent / "reports"
 CONCURRENCY_LEVELS = (10, 50, 100)
 CALLS_PER_SESSION = 20
 WARMUP_CALLS = 20
+WARM_CONTAINER_LAUNCHES = 20
+UPSTREAM_IMAGE = "portunusmcp:dev"
 
 
 def bench_policy(keys: dict[str, str]) -> dict:
     """Same shape as the item-8 demo: pruned developer, unpruned admin."""
     return {
         "version": 1,
+        "servers": {
+            "default": {
+                "image": UPSTREAM_IMAGE,
+                "command": ["python", "sample_target/benchmark_server.py"],
+            }
+        },
         "identities": [
             {
                 "id": "developer",
@@ -94,7 +105,7 @@ async def preflight_clean() -> None:
 @asynccontextmanager
 async def gateway_session(gw: Gateway, identity: str) -> AsyncIterator[ClientSession]:
     """The integration suite's connect(), but with a long timeout: 100 concurrent
-    initializes each spawn an upstream subprocess and blow past httpx's 5s default."""
+    initializes each launch an upstream container and exceed httpx's 5s default."""
     async with httpx.AsyncClient(
         headers={"X-PortunusMCP-Key": gw.keys[identity]},
         follow_redirects=True,
@@ -112,8 +123,8 @@ async def gateway_session(gw: Gateway, identity: str) -> AsyncIterator[ClientSes
 
 @asynccontextmanager
 async def direct_session() -> AsyncIterator[ClientSession]:
-    """Baseline: MCP client straight at the overscoped server, no gateway."""
-    params = StdioServerParameters(command=sys.executable, args=[str(OVERSCOPED_SERVER)])
+    """Baseline: MCP client straight at the benchmark server, no gateway."""
+    params = StdioServerParameters(command=sys.executable, args=[str(BENCHMARK_SERVER)])
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -171,7 +182,62 @@ async def bench_single_call(gw: Gateway, n: int) -> dict[str, dict[str, float]]:
     return {"direct": direct, "gateway_cached": gateway, "gateway_cold": cold}
 
 
-async def bench_concurrent(gw: Gateway) -> dict[int, dict[str, float]]:
+async def bench_container_initialization(gw: Gateway) -> dict[str, object]:
+    async def once() -> float:
+        start = time.perf_counter()
+        async with gateway_session(gw, "developer"):
+            elapsed = (time.perf_counter() - start) * 1000
+            await asyncio.sleep(0.05)  # let initialized notification settle before DELETE
+            return elapsed
+
+    first = await once()
+    warm = [await once() for _ in range(WARM_CONTAINER_LAUNCHES)]
+    return {"first_ms": first, "warm": dist(warm)}
+
+
+def _memory_mib(value: str) -> float:
+    match = re.fullmatch(r"\s*([\d.]+)(B|KiB|MiB|GiB)\s*", value)
+    if match is None:
+        raise ValueError(f"unexpected docker memory value: {value!r}")
+    number, unit = match.groups()
+    scale = {
+        "B": 1 / 2**20,
+        "KiB": 1 / 2**10,
+        "MiB": 1,
+        "GiB": 2**10,
+    }
+    return float(number) * scale[unit]
+
+
+def aggregate_upstream_memory_mib(namespace: str) -> float:
+    containers = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "-q",
+            "--filter",
+            "label=io.portunusmcp.managed=true",
+            "--filter",
+            f"label=io.portunusmcp.namespace={namespace}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    if not containers:
+        return 0
+    rows = subprocess.run(
+        ["docker", "stats", "--no-stream", "--format", "{{.MemUsage}}", *containers],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    return sum(_memory_mib(row.split("/", 1)[0]) for row in rows)
+
+
+async def bench_concurrent(
+    gw: Gateway, namespace: str
+) -> tuple[dict[int, dict[str, float]], float]:
     """Scenario 3: p95 across all calls at each concurrency level, one gateway process,
     each session owning its own upstream stdio subprocess."""
 
@@ -179,6 +245,7 @@ async def bench_concurrent(gw: Gateway) -> dict[int, dict[str, float]]:
         try:
             async with gateway_session(gw, "developer") as session:
                 await barrier.wait()  # every session initialized before anyone is timed
+                await barrier.wait()  # benchmark process samples live container memory
                 call = functools.partial(session.call_tool, "read_file", {"path": "bench.txt"})
                 await timed_calls(call, 2)
                 return await timed_calls(call, CALLS_PER_SESSION)
@@ -187,18 +254,22 @@ async def bench_concurrent(gw: Gateway) -> dict[int, dict[str, float]]:
             raise
 
     results: dict[int, dict[str, float]] = {}
+    upstream_memory_mib = 0.0
     for level in CONCURRENCY_LEVELS:
-        barrier = asyncio.Barrier(level)
+        barrier = asyncio.Barrier(level + 1)
         # return_exceptions so every worker has fully unwound before we re-raise —
         # otherwise leaked workers keep hitting the gateway during teardown.
-        per_session = await asyncio.gather(
-            *(worker(barrier) for _ in range(level)), return_exceptions=True
-        )
+        workers = [asyncio.create_task(worker(barrier)) for _ in range(level)]
+        await barrier.wait()
+        if level == CONCURRENCY_LEVELS[-1]:
+            upstream_memory_mib = aggregate_upstream_memory_mib(namespace)
+        await barrier.wait()
+        per_session = await asyncio.gather(*workers, return_exceptions=True)
         failures = [r for r in per_session if isinstance(r, BaseException)]
         if failures:
             raise failures[0]
         results[level] = dist([lat for session_lats in per_session for lat in session_lats])
-    return results
+    return results, upstream_memory_mib
 
 
 async def bench_payload_size(gw: Gateway) -> dict[str, float]:
@@ -226,6 +297,7 @@ def max_rss_mib() -> float:
 
 def render(report: dict) -> str:
     single, conc, payload = report["single_call"], report["concurrent"], report["payload_size"]
+    initialization = report["container_initialization"]
     overhead = {k: single["gateway_cached"][k] - single["direct"][k] for k in single["direct"]}
     lines = [
         "# PortunusMCP benchmark report",
@@ -235,7 +307,7 @@ def render(report: dict) -> str:
         f"- N={report['n']} sequential calls/scenario; {CALLS_PER_SESSION} calls/session "
         "at each concurrency level; latencies as mean / p50 / p95 / p99",
         "- one in-process gateway; cold cache = Redis DEL of the schema key before each "
-        "timed call; direct baseline has no cache, so the cold row reuses it",
+        "timed call; gateway upstreams are real Docker containers",
         "",
         "| Scenario | Direct call | Through gateway | Overhead (gateway − direct) |",
         "|---|---|---|---|",
@@ -251,8 +323,13 @@ def render(report: dict) -> str:
         f"| {payload['pruned_bytes']:.0f} B (pruned developer) "
         f"| {payload['reduction_pct']:.1f}% reduction |",
         "",
+        f"Container initialization: first {initialization['first_ms']:.2f} ms; "
+        f"next {WARM_CONTAINER_LAUNCHES} p50 {initialization['warm']['p50']:.2f} ms / "
+        f"p95 {initialization['warm']['p95']:.2f} ms.",
         f"Peak RSS after the {CONCURRENCY_LEVELS[-1]}-session run: "
-        f"{report['max_rss_mib']:.0f} MiB (gateway + harness share the process).",
+        f"{report['max_rss_mib']:.0f} MiB (gateway + harness share the process); "
+        f"aggregate upstream container memory while initialized: "
+        f"{report['upstream_memory_mib']:.0f} MiB.",
     ]
     return "\n".join(lines)
 
@@ -268,19 +345,34 @@ async def main() -> None:
     settings.business_hours_start_utc = 0
     settings.business_hours_end_utc = 24
     settings.risk_freq_threshold = 10**9
+    settings.max_sessions_per_identity = max(CONCURRENCY_LEVELS)
+    settings.max_inflight_calls_per_identity = max(CONCURRENCY_LEVELS)
+    settings.tool_call_rate_limit = (
+        WARMUP_CALLS + 2 * n + sum(level * (2 + CALLS_PER_SESSION) for level in CONCURRENCY_LEVELS)
+    )
+    for logger_name in (
+        "httpx",
+        "mcp.client.streamable_http",
+        "mcp.server.streamable_http",
+        "services.gateway.jsonrpc_interceptor",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    namespace = os.environ.get("UPSTREAM_RUNTIME_NAMESPACE", "")
+    if not namespace:
+        sys.exit("UPSTREAM_RUNTIME_NAMESPACE is required (for example: portunusmcp-benchmark)")
 
     await preflight_clean()
     keys = {"developer": secrets.token_urlsafe(32), "ops-admin": secrets.token_urlsafe(32)}
     with tempfile.TemporaryDirectory() as tmp:
         policy_path = Path(tmp) / "bench-policy.yaml"
         policy_path.write_text(yaml.safe_dump(bench_policy(keys)))
-        async with running_gateway(
-            policy_path, f"{sys.executable} {OVERSCOPED_SERVER}", keys
-        ) as gw:
+        async with running_gateway(policy_path, "", keys, isolate_upstreams=True) as gw:
+            print("measuring per-session container initialization ...")
+            initialization = await bench_container_initialization(gw)
             print(f"gateway up at {gw.url}; running single-call scenarios (N={n}) ...")
             single = await bench_single_call(gw, n)
             print("running concurrent-session scenarios ...")
-            concurrent = await bench_concurrent(gw)
+            concurrent, upstream_memory_mib = await bench_concurrent(gw, namespace)
             payload = await bench_payload_size(gw)
 
     report = {
@@ -291,10 +383,12 @@ async def main() -> None:
         "host": f"{platform.system()} {platform.release()} {platform.machine()}",
         "python": platform.python_version(),
         "n": n,
+        "container_initialization": initialization,
         "single_call": single,
         "concurrent": concurrent,
         "payload_size": payload,
         "max_rss_mib": max_rss_mib(),
+        "upstream_memory_mib": upstream_memory_mib,
     }
     rendered = render(report)
     print("\n" + rendered)

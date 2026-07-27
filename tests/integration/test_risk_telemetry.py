@@ -1,8 +1,7 @@
-"""Item 18 telemetry factors end to end: repeated denials raise the next scored
-call's risk, a spike of failed key lookups does the same gateway-wide, and a tool's
-drift history keeps counting after re-approval (audit log, not tool_baselines, is
-the source of truth). Business hours are dropped as in test_risk_approval so scores
-are time-of-day independent."""
+"""Risk telemetry end to end: repeated denials raise the next scored call's risk,
+failed authentication does not affect another source's score (item 43), and a tool's
+drift history keeps counting after re-approval (audit log, not tool_baselines, is the
+source of truth). Business hours are dropped so scores are time-of-day independent."""
 
 import secrets
 import sys
@@ -97,24 +96,58 @@ async def test_repeated_denials_raise_the_next_scored_call(telemetry_gateway: Ga
     assert await allow_factors("echo") == {"prior_denial_rate"}
 
 
-async def test_auth_failure_spike_raises_every_identitys_calls(
+async def test_auth_failures_throttle_the_source_without_changing_victim_risk(
     telemetry_gateway: Gateway,
 ) -> None:
-    # Credential stuffing: wrong keys past the threshold (default >5 in 5 min)...
+    # Credential stuffing: the sixth wrong key is source-throttled.
     async with httpx.AsyncClient() as client:
-        for _ in range(6):
+        for attempt in range(6):
             response = await client.post(
                 f"{telemetry_gateway.url}/mcp/",
-                headers={"X-PortunusMCP-Key": "not-a-real-key"},
-                json={},
+                headers={
+                    "X-PortunusMCP-Key": "not-a-real-key",
+                    "X-Forwarded-For": "198.51.100.10",
+                },
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
             )
-            assert response.status_code == 401
+            assert response.status_code == (401 if attempt < 5 else 429)
+        assert int(response.headers["Retry-After"]) > 0
 
-    # ...then a perfectly valid call carries the gateway-wide spike as a factor.
+    # A different source's valid call remains unchanged by the attacker's failures.
     async with connect(telemetry_gateway.url, telemetry_gateway.keys["agent"]) as session:
         result = await session.call_tool("echo", {"text": "hi"})
         assert isinstance(result.content[0], TextContent)
-    assert await allow_factors("echo") == {"auth_failures"}
+    assert await allow_factors("echo") == set()
+
+
+async def test_auth_failure_budget_is_shared_with_admin_and_missing_keys_stay_401(
+    telemetry_gateway: Gateway,
+) -> None:
+    source = "198.51.100.20"
+    async with httpx.AsyncClient() as client:
+        for _ in range(6):
+            await client.post(
+                f"{telemetry_gateway.url}/mcp/",
+                headers={"X-PortunusMCP-Key": "wrong", "X-Forwarded-For": source},
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            )
+        blocked = await client.get(
+            f"{telemetry_gateway.url}/admin/policy",
+            headers={
+                "X-PortunusMCP-Key": telemetry_gateway.keys["ops-admin"],
+                "X-Forwarded-For": source,
+            },
+        )
+        assert blocked.status_code == 429
+        assert blocked.json()["detail"] == "authentication rate limit exceeded"
+        assert int(blocked.headers["Retry-After"]) > 0
+
+        missing = await client.post(
+            f"{telemetry_gateway.url}/mcp/",
+            headers={"X-Forwarded-For": source},
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        )
+        assert missing.status_code == 401
 
 
 @pytest.fixture

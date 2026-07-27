@@ -10,14 +10,14 @@ Core design of PortunusMCP: the decision pipeline, every component, failure beha
 
 ### 4.1 High-level flow
 
-The client-facing transport is **Streamable HTTP** (the MCP spec deprecated the standalone SSE transport in 2025-03); the upstream side is a stdio subprocess per session (see §4.8, Session Manager).
+The client-facing transport is **Streamable HTTP** (the MCP spec deprecated the standalone SSE transport in 2025-03); the upstream side is stdio to a dedicated hardened Docker container per session (see §4.8, Session Manager, and ADR-007).
 
 ```mermaid
 sequenceDiagram
     participant Client as MCP Client (Streamable HTTP)
     participant Gateway as PortunusMCP Gateway
     participant Audit as Audit Log (Postgres)
-    participant Server as Upstream MCP Server (stdio)
+    participant Server as Isolated upstream container (stdio)
 
     Client->>Gateway: initialize (capabilities)
     Gateway->>Server: initialize (forwarded)
@@ -138,8 +138,9 @@ graph TD
         Simulator["Policy Simulator (admin API)"]
     end
 
-    UpClient --> SrvA["MCP Server A (stdio subprocess, per session)"]
-    UpClient --> SrvB["MCP Server B (stdio subprocess, per session)"]
+    UpClient --> Docker["Local Docker daemon (Unix socket)"]
+    Docker --> SrvA["MCP Server A container (per session)"]
+    Docker --> SrvB["MCP Server B container (per session)"]
 
     Replay --> Redis[("Redis: nonces, schema cache, risk counters, session TTL")]
     Risk --> Redis
@@ -157,57 +158,54 @@ graph TD
     Verifier["audit_verifier sidecar (separate process, read-only chain walk)"] --> PG
 ```
 
-Edges elided for readability: Auth bumps the gateway-wide auth-failure counter in Redis on wrong-key attempts; the Interceptor bumps the per-identity denial counter in Redis on every `DENY_*` terminal; the Decision Explainer reads the shared schema cache for dry-run param validation. The verifier sidecar reads only the public signing key — the private key never leaves the gateway process.
+Edges elided for readability: Auth uses a source-scoped Redis failure window before credential verification; the Interceptor bumps the per-identity denial counter in Redis on every `DENY_*` terminal; the Decision Explainer reads the shared schema cache for dry-run param validation. The verifier sidecar reads only the public signing key — the private key never leaves the gateway process.
 
 ### 4.5 Deployment diagrams
 
-**(a) MVP — Docker Compose (what this repo runs today).** Five services on one host; the upstream MCP server is *not* a compose service — it's a stdio subprocess spawned per session inside the gateway container (registered in the policy's `servers:` block, item 35). The `rogue` service exists only to host the demo's mutation endpoint; the rogue MCP server itself also runs as stdio subprocesses inside the gateway.
+**(a) Explicit demo profile (`compose.demo.yml`).** This intentionally unsafe local stack publishes Postgres, Redis, the rogue mutation endpoint, and optional anonymous monitoring. It uses default development credentials and tag-pinned images. The fixed `portunusmcp-demo` project name and explicit file/env arguments prevent it from being mistaken for the production profile. The actual rogue MCP server still runs through the same isolated per-session container model; the `rogue` service only hosts its demo mutation/status surface.
 
 ```mermaid
 graph TD
     C["MCP client (host)"] -->|"Streamable HTTP :8000"| G
 
-    subgraph Compose["Docker Compose, single host"]
-        subgraph GWC["gateway container"]
-            G["PortunusMCP Gateway (FastAPI)"]
-            U["stdio upstream subprocess, one per session"]
-            G --> U
-        end
-        PG[("postgres:16  :5432")]
-        R[("redis:7  :6379")]
+    subgraph Demo["portunusmcp-demo (unsafe local profile)"]
+        G["gateway container (FastAPI + Docker CLI)"]
+        PG[("postgres :5432 published")]
+        R[("redis :6379 published")]
         V["verifier sidecar (audit_verifier_daemon, read-only)"]
         RG["rogue admin service :9800 (demo only)"]
     end
 
+    G -->|"Unix Docker socket"| D["Docker daemon"]
+    D --> U["hardened upstream container, one per session"]
+    G -->|"stdio via docker attach"| U
     G --> PG
     G --> R
     V --> PG
-    RG -.->|"shared .rogue-state bind mount"| G
+    RG -.->|"namespaced named volume"| U
 ```
 
-Volume posture, security-relevant: `./policies` is mounted **read-only** into the gateway (a compromised gateway can't persist a policy backdoor), with only the `./policies/revisions` submount writable for activation snapshots; `./secrets` is read-only, and the verifier container mounts it only to read the **public** key — the signing private key is never given to any other service.
-
-**(b) Production target (Phase 4, not built).**
+**(b) Supported production profile (`compose.prod.yml`).** Production is one hardened gateway replica on one Docker host. The gateway is loopback-published for an operator-managed TLS reverse proxy. Postgres and password-protected, AOF-backed Redis have no host ports and live on an internal data network. A one-shot migration container must complete before gateway/verifier startup. Optional Prometheus/Grafana use the edge/metrics network, loopback-only UIs, persistent data, and required Grafana login. All service images are digest-pinned; every policy-registered production upstream should be too.
 
 ```mermaid
 graph TD
-    LB[Load Balancer / ALB] --> G1[Gateway replica 1]
-    LB --> G2[Gateway replica 2]
-    LB --> G3[Gateway replica 3]
-    G1 --> RedisC[(Redis - shared, ElastiCache)]
-    G2 --> RedisC
-    G3 --> RedisC
-    G1 --> PG[(Postgres - shared, RDS)]
-    G2 --> PG
-    G3 --> PG
-    G1 --> Servers[Upstream MCP Servers - network transport]
-    G2 --> Servers
-    G3 --> Servers
+    TLS["Operator TLS reverse proxy"] -->|"loopback :8000"| G["gateway (scale: 1)"]
+    G -->|"internal data network"| PG[("Postgres")]
+    G -->|"internal data network"| R[("Redis + AOF")]
+    M["one-shot Alembic migration"] --> PG
+    V["verifier"] --> PG
+    P["optional Prometheus"] --> G
+    P --> V
+    GF["optional Grafana + login"] --> P
+    G -->|"Unix Docker socket"| D["local Docker daemon"]
+    D --> U["hardened upstream container per session"]
 ```
 
-Every gateway replica is stateless and reads/writes the same Redis and Postgres instances — replay nonces, schema cache, risk counters, and session-liveness keys are all in Redis; audit chain, policy versions, drift baselines, and approvals are all in Postgres — so adding replicas behind the load balancer is the entire scaling story for **network-connected (Streamable HTTP) upstream servers**; no session affinity or local cache required. See section 10 for the write-amplification caveat this introduces on the Postgres side.
+Every production service has a read-only root, dropped capabilities, no-new-privileges, memory/CPU/PID limits, bounded Docker JSON logs, and only its required writable volumes/tmpfs. The gateway receives one writable policy root (active file, staging journal, revision snapshots), one writable audit-key root (active private key, rotation journal, append-only public keyring), and the Docker socket; the verifier receives only the public-key subdirectory read-only. Production gateway-only policy secrets live in a separate env file rather than exposing Compose/Grafana credentials to the gateway.
 
-> **Explicit scoping — the stdio/multi-replica conflict, resolved:** a `stdio`-connected upstream server is spawned as a child subprocess by whichever gateway replica first handles that session; it is not visible to, or shareable with, any other replica. If a client's requests are load-balanced across replicas (the default behavior of an ALB with no affinity configured), a `stdio` server's subprocess on Replica 1 is simply unreachable from Replica 2. This is a real constraint, not an edge case, so it's stated plainly rather than left implied by "stateless replicas": **multi-replica, load-balanced deployment is supported only for network-connected upstream servers.** Any deployment that needs a `stdio`-connected server must either (a) configure sticky sessions at the load balancer so a given client always lands on the replica that owns its subprocess, or (b) run the gateway as a single instance for that server. This is documented as a hard deployment constraint, not a future fix — it follows directly from what a local subprocess is. (The Compose MVP above sidesteps it entirely: one gateway instance, so every stdio subprocess is local by construction.)
+The gateway's Docker socket is intentionally **root-equivalent access to the host**. It creates the boundary between upstreams and gateway secrets, but means a shell compromise of the gateway is a host compromise. `DOCKER_GID` grants socket access explicitly; this is an operator trust decision, not a sandbox.
+
+The single-replica constraint is correctness, not sizing advice: Session Manager/container handles are in memory, and item 23 experimentally proved two audit-writer instances can fork the chain. Remote Streamable-HTTP upstreams, a distributed atomic audit writer, and true multi-replica operation remain explicitly deferred. Terraform/ECS is likewise deferred; `compose.prod.yml` is its compose-level prerequisite, not a substitute claim that cloud infrastructure exists.
 
 ### 4.6 Data flow diagram (single request, all stages)
 
@@ -249,17 +247,16 @@ graph TD
 - **Team-owned vs org-owned servers**: an internal platform team's server that went through security review shouldn't be scored identically to a side-project server someone registered for their own agent — yet today the only lever is enumerating tools per `server_id`, which encodes *authorization*, not *confidence*.
 - **Drift history as a trust signal**: a server whose schema has mutated five times this month is inherently less trustworthy than one stable for a year. The item-18 drift-history risk factor already implements exactly this signal *per tool*; a trust tier is the same idea lifted to the server as a whole.
 
-**The extension point: `trust_tier` on server registration.** When multi-server support grows a real registration record, it would carry an admin-assigned tier (with an optional numeric score for the Risk Engine), sketched here as policy YAML — **this key is not implemented; the policy loader will reject it today**:
+**The extension point: `trust_tier` on server registration.** The typed server registry could later carry an admin-assigned tier (with an optional numeric score for the Risk Engine), sketched here as policy YAML — **these keys are not implemented; the policy loader rejects them today**:
 
 ```yaml
 # SKETCH ONLY — not implemented; shown as the designed extension point.
 servers:
-  - server_id: "github-mcp"
+  github-mcp:
+    image: "ghcr.io/acme/github-mcp@sha256:..."
+    command: ["github-mcp"]
     trust_tier: "org-verified"     # org-verified | team-owned | third-party
     trust_score: 90                # 0-100, admin-assigned; drift history could decay it
-  - server_id: "community-scraper"
-    trust_tier: "third-party"
-    trust_score: 40
 ```
 
 Two consumers, both fitting mechanisms that already exist:
@@ -267,20 +264,30 @@ Two consumers, both fitting mechanisms that already exist:
 1. **Risk Engine factor.** A `server_trust` factor is one more `evaluate(ctx) -> RiskFactor` function appended to the fixed factor list (§4.8) — low trust contributes weight, high trust contributes nothing; no engine change. The same `delete_repo` call then scores higher through the community server than through the org-verified one, and can cross the CHALLENGE or approval threshold on that difference alone. Decay rules would mirror item 18's boundary: an admin approving one call must not erase a server's instability record, so `server_trust` would be non-decayable like `drift_history`.
 2. **Policy scoping by tier.** Grants could say `conditions: ["server.trust_tier == 'org-verified'"]` (a third attribute root alongside `identity.*`/`context.*`/`risk.*` — an evaluator vocabulary addition, not a language change) instead of enumerating `server_id`s. This matters operationally once registered servers outgrow hand-enumeration: "read-only tools on any third-party server, write tools only on org-verified ones" is one rule, not one per server.
 
-**Explicit non-goals for v1:** no per-server trust scoring in code, no `trust_tier`/`trust_score` in the policy schema or loader, no multi-server registry or routing layer, no automatic tier derivation from drift history. Multi-server trust scoring is tracked as documented-only future work in `ROADMAP.md` item 29, alongside the other deliberate deferrals (OPA/Cedar migration, OAuth/OBO). What this section commits to is only the shape of the extension — so if the project grows into it, trust lands as one risk factor plus one attribute root, not a redesign.
+**Explicit non-goals for v1:** no per-server trust scoring, no `trust_tier`/`trust_score`, and no automatic tier derivation from drift history. Multi-server registration/routing exists; trust tiers remain documented-only future work in `ROADMAP.md` item 29.
 
 ### 4.8 Component responsibilities
 
-**Session Manager** — owns the lifecycle of one client↔gateway↔server session. Assigns a session ID, tracks negotiated capabilities, holds a reference to the upstream connection (stdio subprocess or SSE stream), and tears everything down cleanly on disconnect so no process or credential leaks across sessions. Each session is isolated: no shared state, no shared subprocess.
+**Session Manager** — owns one client↔gateway↔server session. It reserves one of three default per-identity session slots before the fail-closed `SESSION_START` write and container launch; starting, active, and stopping sessions all retain that slot, and partial creation failures reap any spawned container before releasing it. It also owns the five-default per-identity in-flight quota and active `(session_id, request_id)` set for `tools/call`. A call has one 60-second end-to-end deadline covering authorization, audit, upstream execution, and response delivery. HTTP disconnection is not cancellation: the slot remains until the upstream response or deadline. A deadline queues JSON-RPC `-32005` when possible, makes the old session unavailable, and reaps its container and every outstanding call. Each session has its own container and runtime fingerprint.
 
-**Subprocess shutdown handling, explicit:** per-session teardown on disconnect covers the normal case, but it doesn't cover a process-level shutdown signal — if Docker/Compose sends `SIGTERM` to the gateway container while `stdio` child processes are running, those subprocesses don't automatically die with their parent and can be left as zombies or orphans (`asyncio.create_subprocess_exec` gives no such guarantee by itself). The Session Manager therefore maintains a registry of all currently-active subprocess handles, and the gateway hooks into FastAPI's `lifespan` context manager (equivalently, a `signal.signal(SIGTERM, ...)` handler) to walk that registry on shutdown: call `.terminate()` on every active subprocess, wait a short grace period (default 5s), then `.kill()` anything still alive before the gateway process itself exits. **The handler is defensive against processes that are already gone:** if a subprocess in the registry has already exited on its own (e.g. the upstream server crashed independently, or the OS already reaped it), calling `.terminate()` on it can raise `ProcessLookupError` or `OSError`; the shutdown loop explicitly catches and swallows these per-subprocess, logs the attempt, and continues to the next entry — an uncaught exception here would abort the loop partway through and leave every *subsequent* subprocess in the registry uncleaned, which is precisely the failure mode this handler exists to prevent. This matters most during local development and CI, where the gateway container restarts frequently — without it, repeated restarts silently accumulate orphaned processes over a session.
+**Container lifecycle and policy activation:** `DockerRuntime` accepts only a local Unix Docker daemon. Startup removes containers carrying this gateway namespace's management labels, then preflights every configured image and namespaced volume; any failure aborts startup before policy activation. SIGHUP performs the same preflight before swapping policy and keeps the last-known-good policy on failure. Rollback returns HTTP 409 if its historical runtime is unavailable. After a successful reload or rollback, the Session Manager disconnects only sessions whose runtime fingerprint changed; cleanup errors are logged but never stop the remaining disconnects.
 
-**JSON-RPC Interceptor** — the dispatch core. Every inbound JSON-RPC message is parsed, its `method` field is matched against a handler (`initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, etc.), and routed. Any method not explicitly handled is passed through unmodified but still logged — deny-by-default is not enforced universally on day one (would break legitimate use), but every unhandled method is visible in the audit trail for review.
+The fixed launch posture is UID 65532, read-only root, 16 MiB `noexec,nosuid,nodev` `/tmp`, init, `no-new-privileges`, all capabilities dropped, `--pull never`, and memory/CPU/PID limits (defaults 256 MiB, 0.5 CPU, 64 PIDs; memory swap equals memory). Network is `none` unless `bridge` is explicit. Policy `env` maps container destinations to host-variable sources prefixed `PORTUNUSMCP_UPSTREAM_`; no ambient gateway environment is inherited. Named volumes are namespace-bound and read-only. See ADR-007.
+
+**HTTP edge + JSON-RPC Interceptor** — before auth or SDK transport handling, every `/mcp/*` request passes the MCP SDK's Host/Origin validator. POST bodies are bounded by declared and streamed size (1 MiB), decoded as strict UTF-8, scanned for a maximum object/array depth of 32 with string/escape awareness, parsed by stdlib `json`, and validated through the SDK's JSON-RPC model; the unchanged bounded bytes are then replayed to the transport. Only a valid sessionless `initialize` may create a session. Authenticated `tools/call` attempts are fixed-window rate-counted even when their server/session is invalid, their id is already active, or they are notification-shaped (notifications are rejected rather than entering pass-through). The Interceptor then matches `method` against a handler (`initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, etc.) and routes it. Any other valid session method is passed through unmodified but still logged.
 
 **Policy Engine** — loads a YAML policy file at startup (hot-reloadable via file watch or SIGHUP), validates it against a Pydantic schema, and exposes `resolve(identity, server_id, tool_name, context) -> Decision`. The base grant is still RBAC (`allowed_tools` / `denied_tools` per identity per server — this stays because it's simple and covers 90% of cases cheaply), but each rule can carry an optional ABAC condition evaluated against typed attributes at call time:
 
 ```yaml
 version: 4
+servers:
+  github-mcp:
+    image: "ghcr.io/acme/github-mcp@sha256:..."
+    command: ["github-mcp", "--stdio"]
+    env:
+      GITHUB_TOKEN: PORTUNUSMCP_UPSTREAM_GITHUB_TOKEN
+    network: none
+    resources: {memory_mb: 256, cpus: 0.5, pids: 64}
 identities:
   - id: "agent-readonly-01"
     api_key_hash: "sha256:..."
@@ -304,7 +311,7 @@ Conditions are parsed once at policy load into a small AST (a hand-rolled boolea
 
 **Missing-attribute handling, specified precisely:** if a condition references an attribute that isn't present in the request context (e.g. `context.hour < 20` where the incoming context has no `hour` key), the naive failure mode is an unhandled exception that propagates up and trips the fail-closed behavior in the Failure Modes table (§5) — turning a missing optional field into an availability incident, not a security event. The fix is *not* simply "treat the missing attribute as `False`" injected at the leaf, because that's unsafe once `not` is in play: `not(context.hour < 20)` with a `False` substituted for the missing comparison would evaluate to `True`, silently *granting* access on a rule whose intent was almost certainly the opposite. Instead: **any condition containing an unresolvable attribute reference evaluates the entire condition (not the sub-expression) as not-satisfied**, before any combinator logic (`and`/`or`/`not`) runs on it — this sidesteps the inversion problem entirely, since "not satisfied" is decided prior to negation, not after. Each occurrence also logs a `POLICY_ERROR` event so a genuinely missing/misconfigured attribute is visible in the audit trail as a policy authoring bug, rather than silently changing access outcomes in either direction.
 
-**Policy versioning** — every policy file load is stamped with a monotonic `version` integer and a content hash, and a copy is persisted to `policies/revisions/v{n}.yaml` plus a `policy_versions` table (`version, content_hash, activated_at, activated_by`). Every audit log row records which policy `version` was active at decision time — so replaying or auditing history is always unambiguous about which rules applied. Rollback is just re-activating a prior version row; no full diff-viewer UI is built (that's a frontend project on its own, deferred), but `scripts/verify_audit_chain.py` gains a `--diff-policy v3 v4` mode that prints a structured YAML diff to the terminal, plus an `--html` flag that generates a standalone side-by-side HTML diff page via Python's stdlib `difflib.HtmlDiff` — a small addition (no new dependency) that gives a security reviewer a shareable, browser-openable artifact instead of a terminal dump, without building a real admin UI.
+**Policy versioning and durable promotion** — every policy is stamped with a monotonic `version` integer and content hash, with exact bytes persisted to `revisions/v{n}.yaml` plus `policy_versions`. API rollout, rollback, and SIGHUP share one process-local lock and one filesystem journal. The ordered handoff is: validate and runtime-preflight; stage bytes; record the revision; append `POLICY_ACTIVATED` under the old policy; atomically replace `policy.yaml`; swap the in-memory engine; clean the journal. Startup discards a pre-handoff stage or completes a post-handoff promotion. A live post-handoff filesystem failure marks policy readiness failed and MCP traffic returns 503 until restart recovery. SIGHUP consumes adjacent `policy.next.yaml` only on success; failures leave it for correction. API candidates must retain the calling bearer admin, while SIGHUP requires at least one admin but has no caller-continuity check. Rollback is durable and follows the same handoff. `scripts/verify_audit_chain.py --diff-policy v3 v4 [--html]` remains the offline revision diff.
 
 **Schema Pruner** — takes the raw `tools/list` response from upstream and the policy-resolved allow-set, returns only the intersection. Denied tools are removed entirely from the response — not just marked, actually absent — so the LLM client's planning step never sees them as an option.
 
@@ -334,7 +341,6 @@ Rather than one monolithic scoring function, each signal is implemented as a sma
 - Whether the tool's schema is mid-drift-review (an unresolved `DRIFT_MEDIUM` bumps risk even if calls aren't blocked outright)
 - **Prior denial rate** for this identity over a rolling window — an identity that's been denied repeatedly is a stronger risk signal than one with a clean history
 - **Recent schema drift history** for the target tool, even if already re-approved — a tool that changed shape twice in the last week is inherently riskier than one that's been stable for months
-- **Recent authentication failures** for this identity (a small addition to the Auth Layer: one Redis counter incremented on failed API-key lookups, decayed over a rolling window) — a spike in auth failures just before a successful call is a classic credential-stuffing pattern
 - **Suspicious baseline** (item 36b): the tool's *approved* description text matched the baseline-time content heuristics (instruction-override phrasing, hidden/zero-width unicode, encoded payloads) — a static property of the tool's content, non-decayable like the sensitivity tier, and honest about being a heuristic: it informs risk, it never blocks
 
 **Determinism is a deliberate design choice, not a placeholder for a future ML model.** This project's value proposition is security, determinism, and explainability — a learned model scoring risk would work against all three: it introduces training-data provenance questions, validation burden, and a decision that can't be fully explained by the Decision Explanation feature below. A weighted, rule-based engine isn't a lesser version of a "real" risk engine here — for this problem, it's the correct architecture, and no ML-based scoring is planned.
@@ -391,9 +397,11 @@ runs the same evaluation path *without* actually forwarding the call — useful 
 - **`bearer` (default)** — client presents an API key in a custom header (`X-PortunusMCP-Key`). The key itself is a high-entropy secret (a 32-byte random value, base64-encoded, generated at identity-creation time via `scripts/generate_api_key.py` and shown to the operator exactly once); the policy store never holds the raw key, only `SHA256(key)`. On each request, the gateway hashes the presented key and looks up the resulting hash directly against the stored identity records — a hash-and-lookup, **not** an HMAC or signing scheme. Works with any stock MCP client; the tradeoff is that the credential rides every request, so a captured request is a stolen key.
 - **`signed`** — no secret on the wire at all. The policy holds a *non-secret* `key_id` and the *name* of an environment variable (`signing_secret_env`) the gateway resolves the shared secret from at policy load (fail-closed if unset; secrets never enter the policy file, its revision snapshots, logs, or audit rows). Every request and notification the client sends carries `portunusmcp/key-id` and `portunusmcp/signature` in `params._meta` alongside the nonce/timestamp, where the signature is HMAC-SHA256 over the canonicaljson of `{nonce, timestamp, method, tool, arguments}`. Verification happens at the HTTP edge, before the transport parses the message — any failure is a plain 401. GET (the SSE stream) and DELETE carry no body to sign; they are bound to the session that a signature-verified `initialize` created (residual: possession of a captured session id reads that session's response stream until teardown — see `THREAT_MODEL.md`). `signed` identities cannot be `admin: true` (rejected at load): the `/admin` API authenticates by bearer key only.
 
-A rolling Redis counter tracks failed lookups — wrong bearer keys, unknown key ids, bad signatures — feeding the Risk Engine's auth-failure signal above. No session cookies, no JWTs for v1. OAuth 2.1 On-Behalf-Of token exchange stays a documented later item (this is where you'd map an upstream OAuth token per user identity so the gateway never holds a single shared credential).
+**Source-scoped auth-failure throttling (item 43).** Wrong bearer keys, unknown key ids, and bad signatures share one Redis fixed window per Uvicorn-resolved client IP across MCP and admin authentication (default five failures per five minutes). Uvicorn accepts forwarded client addresses only from `FORWARDED_ALLOW_IPS`; production must configure the actual TLS proxy IP/CIDR. The source address is SHA-256-hashed into `rate:auth_failure:*`, while the first threshold crossing logs the raw IP, auth surface, and retry interval for operator actionability. The sixth failure and every later presented credential — even a valid one — receive HTTP 429 plus `Retry-After` until the original window expires; missing credentials, pre-auth Host/Origin/body rejects, valid credentials that later fail session binding or admin authorization, and signed GET/DELETE on an established session do not count. Redis or source-resolution failure returns HTTP 503. The increment/first-expiry pair is one Redis Lua operation; a concurrent first burst can already be verifying when the threshold crosses, and source rotation or shared NATs remain the explicit ceiling. The old gateway-wide authorization-risk contribution is gone: unauthenticated traffic can no longer raise an unrelated identity's score.
 
-**Session idle timeout** — per-session teardown on a clean disconnect, and the SIGTERM subprocess-cleanup handler, both cover intentional shutdown paths. Neither covers a session that goes silent without disconnecting properly (a network drop, a crashed client) — that session's subprocess or SSE stream would otherwise sit alive indefinitely until something else notices. The fix: each session's last-activity timestamp is tracked as a Redis key with a TTL (`session:{id}:last_seen`, default 5 minutes, refreshed on every request); when the key expires, a lightweight sweep (a periodic task, not a per-request check) tears the session down exactly as it would on a clean disconnect — closing the subprocess/stream, releasing the session-manager registry entry. This is a small addition on top of infrastructure that already exists (Redis TTLs are already used for replay nonces and rate limiting) rather than a new mechanism.
+Policy loading also rejects duplicate identity ids, bearer API-key hashes, and signed key ids before constructing the lookup dictionaries. The check is exact and case-sensitive, reports the colliding value/identities (or list positions for duplicate ids), and therefore applies equally to startup, SIGHUP, rollout, rollback, and simulation. No session cookies or JWTs exist in v1. OAuth 2.1 On-Behalf-Of token exchange stays a documented later item.
+
+**Session idle timeout** — clean disconnect and gateway shutdown cover intentional paths; a Redis TTL (`session:{id}:last_seen`, default 5 minutes, refreshed on each request) covers silent clients. While any call is outstanding, a per-session heartbeat refreshes the key every half-TTL; Redis refresh failure tears the session down fail-closed. The heartbeat stops after the final call completes, so a later genuinely idle session expires and is reaped normally.
 
 **Audit Log** — every decision point (session start, tools/list served, DENY, ALLOW, CHALLENGE, APPROVAL_PENDING, drift detected at any severity, admin approval, policy activation) is written as an append-only row with a hash chain:
 
@@ -401,9 +409,13 @@ A rolling Redis counter tracks failed lookups — wrong bearer keys, unknown key
 H_t = SHA256(H_(t-1) || canonical_json(payload_t))
 ```
 
-On top of the hash chain, every row's hash is additionally signed with an ECDSA (P-256) private key held only by the gateway process (never checked into the repo, injected via Secrets Manager). This closes the gap a plain hash chain has: if an attacker gets write access to Postgres, they can recompute a self-consistent hash chain from a tampered point forward — a hash chain alone only proves internal consistency, not that it wasn't regenerated. A signature can't be forged without the private key, so the verifier checks both the chain math *and* the signature on each row.
+On top of the hash chain, every row's hash is signed with ECDSA P-256 and records `key_id = sha256:<DER-SPKI fingerprint>`. Public keys live forever in `public/<fingerprint>.pub.pem`, so rotation never makes historical rows unverifiable. Rotation is serialized with the audit writer: generate and stage the new private key, archive its public key, append an old-key-signed `AUDIT_KEY_ROTATED` handoff naming both fingerprints, atomically promote the private key, swap memory, and clear the journal. Startup discards pre-handoff state or completes a committed handoff. A post-handoff live failure makes signing/readiness unavailable and all actions requiring an audit write fail closed.
+
+Migration `0007` initially permits null `key_id` values. The first upgraded startup verifies the complete historical chain and every signature with the active public key before backfilling its fingerprint; verification failure aborts startup. Thereafter the full scanner, incremental verifier, and NDJSON export all use the same row verifier: link, hash, signature selected by fingerprint, and the hash-protected column projections must agree. Missing key material is always a failure; the old “skip signatures when no public key is present” behavior is removed.
 
 **Write-path optimization, without weakening the durability guarantee:** naively, computing `H_t` requires reading the previous row's hash first — a `SELECT MAX(seq)` (or equivalent) before every single insert, which serializes writes more than a typical append-only table would and becomes the first real bottleneck under concurrent load (see §10). The fix is to cache the latest chain hash in a Redis key (`latest_audit_hash`), updated atomically alongside each write (via a Lua script or `WATCH`/`MULTI` transaction so a concurrent writer can't read a stale pointer), removing the Postgres read from the hot path entirely. **The Postgres insert itself stays synchronous** — awaited before the gateway forwards the call upstream — because detaching it via fire-and-forget (e.g. `asyncio.create_task()` with no await) would break the fail-closed "no record, no action" guarantee from §5: if the process crashed or Postgres briefly failed between dispatching a detached write and its completion, a call could execute with no corresponding audit row, which is exactly the ungoverned action this feature exists to prevent. The win from the Redis cache is removing the *slow read* that precedes the write, not removing the write from the critical path.
+
+The existing `ALLOW` row is an authorization-and-dispatch receipt, not proof that the upstream completed successfully. It is deliberately written before dispatch; no completion event was added in item 40. A deadline can terminate the session and container, but it cannot roll back a side effect the upstream began before termination.
 
 Schema (Postgres):
 
@@ -413,6 +425,7 @@ CREATE TABLE audit_log (
     prev_hash      CHAR(64) NOT NULL,
     curr_hash      CHAR(64) NOT NULL,
     signature      BYTEA NOT NULL,      -- ECDSA signature over curr_hash
+    key_id         TEXT,                -- SHA-256 DER-SPKI fingerprint; legacy-null migration
     timestamp      TIMESTAMPTZ NOT NULL DEFAULT now(),
     identity_id    TEXT NOT NULL,
     server_id      TEXT,
@@ -466,6 +479,12 @@ POST /admin/policy/simulate
 
 This is the enterprise-grade version of the same idea — instead of only validating a candidate against reality, it answers "how did this policy actually evolve between v2 and v5, in terms of real request outcomes," which is a materially different and more useful question once a policy has gone through several revisions.
 
+**Operator API and CLI (item 42)** — `services.cli:main` installs as `portunusmcp` and uses only `argparse`, `urllib`, TLS, JSON, and `difflib`. It exposes bounded approval and baseline review queues, decision explanation, raw-YAML policy validation/simulation/rollout, stored revision comparison/rollback, offline bearer/signed/TOTP credential generation, audit-key status/rotation, and verified audit export. Remote URLs require HTTPS; loopback HTTP is the development exception. The admin key comes only from `PORTUNUSMCP_ADMIN_KEY`; mutations confirm unless `--yes`, and JSON-mode mutations refuse to run without it.
+
+Every `/admin` request body is capped at 1 MiB before parsing. Raw policies require UTF-8 `application/yaml`, and authentication precedes YAML work. Queue responses are capped at 100 rows with an explicit `truncated` flag. Baseline detail recomputes drift severity and scanner findings and exposes approved/observed schemas for the CLI's unified diff. Suspicious flags cannot be manually dismissed; only approving newly observed content that scans clean clears one.
+
+`GET /admin/audit/export` verifies before streaming. The NDJSON manifest records inclusive bounds, row count, whether the range is genesis-anchored, and the exact PEM map for keys used by the rows. Following lines contain every audit field, with signatures base64-encoded. Ranges must be positive, present, contiguous, and gap-free. A partial range verifies its own links/signatures but labels the omitted prefix unattested. The CLI writes a same-directory temporary file, verifies it independently, chmods it `0600`, then atomically renames it; existing outputs require `--force`.
+
 ---
 
 
@@ -477,14 +496,19 @@ A security gateway that silently fails open under load or during an outage is wo
 
 | Subsystem unavailable | Behavior | Rationale |
 |---|---|---|
-| Redis (replay guard, rate limiting, cache) | **Fail closed** — deny the call | If the Replay Guard can't check whether a nonce was already seen, it cannot guarantee the request isn't a replay; denying is the only safe default for a security check whose job is exactly "prevent this." |
+| Redis (replay guard, rate limiting, cache) | **Fail closed** — tool-call or source-auth rate-check failure returns HTTP 503 before the decision pipeline; replay/cache failure denies | If the gateway cannot enforce either rate window or check whether a nonce was already seen, silently proceeding would remove a security control during the outage. |
 | Postgres (audit log write) | **Fail closed** — deny the call before it reaches the upstream server | An action that can't be recorded is, for this project's purposes, an action that shouldn't happen — "no record, no action" is the defensible posture even though it costs availability. This is a deliberate trade-off, stated as such. |
+| Audit key rotation/promotion incomplete | **Fail closed** after the audited handoff — signing readiness fails and audited actions stop until startup recovery; a pre-handoff stage is discarded | Once the chain commits the new fingerprint, continuing on an ambiguous key would make later verification non-deterministic. |
+| Policy promotion incomplete | **Fail closed** after the audited handoff — policy readiness fails and MCP returns 503 until startup recovery; pre-handoff staging is discarded | The audit row and durable active file must converge on the same policy before traffic resumes. |
 | Postgres (policy store, read-only lookup) | **Fail closed**, but backed by an in-memory last-known-good policy snapshot with a short grace period (default 60s) to absorb brief connection blips without denying everything during a transient reconnect | Distinguishes "database had a one-second hiccup" from "database is actually down," without pretending a stale policy is fine indefinitely. |
 | Risk Engine (unhandled exception during scoring) | **Fail closed** — treat the exception itself as maximum risk (equivalent to score 100, i.e. deny) | A crashed risk calculation is not the same as "risk is low"; treating a scoring failure as the worst-case score is the only interpretation that doesn't quietly disable the feature under fault conditions. |
+| Local Docker daemon, configured image, or configured named volume unavailable | **Fail closed** — startup aborts; SIGHUP keeps the last-known-good policy; rollback returns 409 | Activating a policy whose isolation runtime cannot be realized must never fall back to an in-process server or weaker launch posture. |
 | Upstream MCP server unreachable | **Fail closed** for that server only — return a JSON-RPC error for calls targeting it; does not affect other registered servers or other identities | This isn't a security decision so much as a normal proxy-availability one, included here for completeness. |
 | Audit verifier daemon itself down | **No blocking effect on live traffic** — the daemon is a detective control, not a preventive one; its own downtime is monitored separately (a missed-heartbeat alert), since blocking live traffic because a background verifier hasn't run recently would be a disproportionate availability cost for a control that's about catching tampering after the fact, not preventing the call. | |
 
-The consistent theme: every subsystem whose failure would silently weaken a security guarantee fails closed, even at an availability cost, and every failure mode is logged as `POLICY_ERROR` (or a more specific code) rather than passing through unnoticed.
+The consistent theme: every subsystem whose failure would silently weaken a security guarantee fails closed, even at an availability cost, and returns a specific failure rather than passing through unnoticed.
+
+`/health` remains liveness-only. `/ready` concurrently checks Postgres, Redis, active-private/public-keyring agreement plus completed legacy backfill/no rotation journal, and no blocked/pending policy promotion under one overall one-second deadline. It returns a named `ok|failed` map and HTTP 503 if any check fails. The Compose gateway healthcheck uses `/ready`.
 
 ---
 
@@ -493,11 +517,14 @@ The consistent theme: every subsystem whose failure would silently weaken a secu
 
 ## 6. Security Hardening Checklist
 
-- Run each upstream stdio server subprocess with dropped capabilities, no network egress unless explicitly allowlisted, and a non-root user.
-- Rate-limit per identity (Redis token bucket) on `tools/call` to blunt automated abuse.
+- **Implemented (item 39):** each upstream runs in a dedicated container as UID 65532 with a read-only root, restricted tmpfs, no new privileges, all capabilities dropped, bounded memory/CPU/PIDs, no swap above memory, a minimal allowlisted environment, and no network unless `bridge` is explicit.
+- **Implemented (item 40):** strict body/depth bounds, SDK Host/Origin validation, per-identity session/in-flight quotas, a 60-second call deadline, and a Redis fixed-window `tools/call` limit (default 60 per 60 seconds). The fixed window is deliberately simple and permits up to twice the configured count across two adjacent window boundaries; replace it only if measured abuse requires a sliding window.
+- **Implemented (item 41):** the production Compose profile is explicit and single-replica, publishes only loopback app/monitoring ports, isolates authenticated Postgres/Redis on an internal network, digest-pins service images, separates gateway-only secrets, and applies read-only roots, dropped capabilities, no-new-privileges, resource ceilings, restart policies, and bounded local logs.
+- **Implemented (item 42):** the admin body boundary is 1 MiB; policy/key mutations are serialized, journaled, audited before atomic promotion, and startup-recoverable; historical audit keys are retained by fingerprint; exported ranges are independently verifiable.
+- **Implemented (item 43):** failed credentials are throttled per trusted-proxy-resolved source across MCP/admin, with fail-closed Redis handling and an immediate warning alert; duplicate identity ids, API-key hashes, and key ids fail policy load.
 - Never log full argument payloads for tools flagged as handling secrets (policy field: `redact_args: true` per tool).
-- API keys stored only as salted hashes; raw keys shown once at creation time via admin CLI, never persisted in plaintext.
-- All inter-service traffic (gateway → Postgres, gateway → Redis) over TLS in production; local dev can use plaintext within the Docker network only.
+- Bearer API keys are 256-bit random values stored only as deterministic SHA-256 hashes; raw keys are shown once by the operator CLI and never persisted in plaintext.
+- The shipped single-host production profile trusts plaintext traffic inside its isolated backend network; a future multi-host deployment must add authenticated TLS between services.
 - Dependency pinning + Dependabot/Renovate for the Python side; run `pip-audit` in CI.
 - Structured logs never include the API key header value, even in DEBUG mode — implement a logging filter that redacts it.
 
@@ -510,11 +537,11 @@ The consistent theme: every subsystem whose failure would silently weaken a secu
 
 *Implemented (item 25). Structured logs shipped from day one (item 13); Prometheus/Grafana were added once core gateway logic was stable so effort wasn't split across two problems at once.*
 
-- **Prometheus metrics** (`services/gateway/metrics.py` — exactly this set, no more): `portunusmcp_tool_calls_total{identity, server, tool, decision}` (incremented at the interceptor's three terminal emission points; `decision` = the audit event type), `portunusmcp_schema_drift_total{server, tool, severity}` (Drift Detector classification writes), `portunusmcp_risk_score` (histogram, observed once per freshly scored call whatever the eventual outcome), `portunusmcp_request_latency_seconds` (histogram, decision-pipeline time per `tools/call` — proxy overhead only, the upstream round trip is excluded), `portunusmcp_audit_chain_verify_failures_total` (verifier failure branch — alert on any increase; this replaced item 11/13's `logger.error`-only alerting), `portunusmcp_replay_denied_total`.
-- **Exposure posture:** unauthenticated but internal-only. Metric labels carry identity ids and tool names, so `/metrics` is never served on the published app port — the gateway starts a separate listener on `METRICS_PORT` (default 9100; the verifier sidecar uses 9101, skipped under `--once`), and docker-compose deliberately does not publish either port. Prometheus scrapes them over the compose network. Metric increments are in-memory and cannot meaningfully fail — no fail-open/fail-closed posture applies.
-- **Prometheus + Grafana containers:** opt-in via `docker compose --profile monitoring up -d` (config in `monitoring/`; Prometheus UI on 9090, Grafana on 3000 with anonymous access for local dev). The default compose stack is unchanged.
+- **Prometheus metrics** (`services/gateway/metrics.py` — exactly this set, no more): `portunusmcp_tool_calls_total{identity, server, tool, decision}` (incremented at the interceptor's three terminal emission points; `decision` = the audit event type; `tool` preserves a name only when it exists in that server's current Redis schema cache, otherwise `other`, including on cache failure), `portunusmcp_schema_drift_total{server, tool, severity}` (Drift Detector classification writes), `portunusmcp_risk_score` (histogram, observed once per freshly scored call whatever the eventual outcome), `portunusmcp_request_latency_seconds` (histogram, decision-pipeline time per `tools/call` — proxy overhead only, the upstream round trip is excluded), `portunusmcp_audit_chain_verify_failures_total` (verifier failure branch), `portunusmcp_replay_denied_total`, and the unlabeled `portunusmcp_auth_throttled_total` (every source-throttled credential attempt). The bundled `PortunusMCPAuthSourceBlocked` warning fires on any five-minute increase in the last counter; notification routing remains operator-managed.
+- **Exposure posture:** unauthenticated but internal-only. Metric labels carry identity ids and tool names, so `/metrics` is never served on the published app port — the gateway starts a separate listener on `METRICS_PORT` (default 9100; the verifier sidecar uses 9101, skipped under `--once`), and neither Compose file publishes those ports. Prometheus scrapes them over the Compose network. Metric increments are in-memory and cannot meaningfully fail — no fail-open/fail-closed posture applies.
+- **Prometheus + Grafana containers:** both explicit Compose files have an opt-in `monitoring` profile. Demo publishes anonymous local Grafana; production binds both UIs to loopback, requires a Grafana login, persists their state, and applies the production hardening/limits.
 - **Grafana dashboard** (`monitoring/grafana/dashboards/portunusmcp.json`, provisioned automatically): panels for allow/deny/challenge rate over time, top denied tools, drift events timeline by severity, risk score distribution, p50/p95/p99 pipeline latency.
-- **Structured logs (structlog, JSON):** one line per decision, correlation ID = session ID, shippable to any log aggregator. Shipped in MVP regardless of the Prometheus/Grafana timeline.
+- **Structured logs (structlog, JSON):** one line per decision, correlation ID = session ID, shippable to any log aggregator. The first auth-throttle crossing additionally logs raw source IP, `mcp|admin` surface, and retry interval, never credential material.
 
 ---
 
@@ -524,7 +551,7 @@ The gateway caches two things per `(server_id)`: the last-seen tool schema set (
 
 - **Schema cache:** invalidated and re-fetched on every `initialize` for a session (a fresh handshake is the natural trust boundary to re-verify against). Additionally carries a TTL (default 10 min) so a long-lived session doesn't trust a stale schema indefinitely between handshakes — on TTL expiry the gateway transparently re-issues `tools/list` upstream and re-runs the drift check before serving the next client request.
 - **ETags:** the gateway's own `tools/list` response to the client includes an ETag derived from `(policy_version, schema_hash)`; a client that supports conditional requests can skip re-parsing an unchanged tool list.
-- **Policy cache:** invalidated immediately on file-watch/SIGHUP reload (no TTL needed — policy changes are explicit operator actions, not upstream server behavior), and every in-flight session's next request re-resolves against the new version rather than finishing out the old one.
+- **Policy cache:** invalidated immediately after durable API/SIGHUP/rollback promotion. The candidate runtime is preflighted before the audit handoff and file swap; after success, sessions whose runtime fingerprint changed are disconnected while unchanged sessions continue against the new policy.
 
 ---
 
@@ -539,32 +566,33 @@ A proxy that adds meaningful latency to every tool call is a hard sell regardles
 
 `tests/benchmarks/run.py` runs N=1000 sequential `tools/call` round trips via the MCP client SDK, timed with `time.perf_counter()`:
 
-- **direct** = stdio client straight at `sample_target/overscoped_server.py`;
-- **gateway** = the same calls through one in-process gateway, with the full §4.2 pipeline active (Replay Guard → auth → RBAC + ABAC conditions → drift check → Risk Engine scoring across all eight factors, Redis-backed behavioral counters included → parameter validation → hash-chained audit write with per-row ECDSA P-256 signing).
+- **direct** = stdio client straight at `sample_target/benchmark_server.py`;
+- **gateway** = the same calls through one in-process gateway, with the full §4.2 pipeline active (Replay Guard → auth → fixed-window rate check → RBAC + ABAC conditions → drift check → Risk Engine scoring across all eight factors, Redis-backed behavioral counters included → parameter validation → hash-chained audit write with per-row ECDSA P-256 signing). Body/depth/deadline and Host/Origin validation remain active. The harness derives only its workload ceilings: session and in-flight limits equal maximum concurrency, and rate allowance equals the computed gateway call count.
 - **Overhead** = gateway − direct.
 - **Cold cache** deletes the Redis schema key before every timed call, forcing an upstream `tools/list` re-fetch plus drift check per call. The direct path has no cache, so its column repeats the baseline.
-- **Concurrency** levels run 20 calls per session against the single gateway process, each session owning its own upstream stdio subprocess.
+- **Container initialization** measures the first launch plus 20 warm launches. Concurrency levels run 20 calls per session at 10/50/100 sessions, each session owning a real hardened Docker container.
+- **Memory** records the gateway+harness process RSS and the aggregate initialized upstream-container memory after the 100-session run.
 
 It also measures the **`tools/list` response size reduction** from schema pruning. Every other metric here answers "how much overhead does the gateway add"; pruning is the one genuine positive claim — smaller wire responses and fewer tokens for the LLM parsing the tool list.
 
 ### Results
 
-Measured **2026-07-10** at commit **`902341f`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, Postgres 16 and Redis 7 in local Docker. Latencies are mean / p50 / p95 / p99.
+Measured **2026-07-27** from the item-43 working tree based on **`98e4a80`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, Postgres 16, Redis 7, and local Docker. Latencies are mean / p50 / p95 / p99.
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 1.38 / 1.33 / 1.56 / 1.94 ms | 13.47 / 12.95 / 16.12 / 24.46 ms | 12.09 / 11.62 / 14.56 / 22.51 ms |
-| Single call, cold schema cache | 1.38 / 1.33 / 1.56 / 1.94 ms | 16.62 / 16.17 / 19.51 / 24.71 ms | — |
-| 10 concurrent sessions (p95) | — | 160.20 ms | — |
-| 50 concurrent sessions (p95) | — | 565.46 ms | — |
-| 100 concurrent sessions (p95) | — | 1228.23 ms | — |
-| `tools/list` payload size (pruned identity) | 1506 B (unpruned) | 797 B | **47.1% reduction** |
+| Single call, cached schema | 0.25 / 0.21 / 0.43 / 0.59 ms | 16.17 / 15.59 / 18.29 / 31.35 ms | 15.93 / 15.38 / 17.85 / 30.76 ms |
+| Single call, cold schema cache | 0.25 / 0.21 / 0.43 / 0.59 ms | 22.14 / 19.26 / 34.01 / 72.71 ms | — |
+| 10 concurrent sessions (p95) | — | 229.20 ms | — |
+| 50 concurrent sessions (p95) | — | 1171.36 ms | — |
+| 100 concurrent sessions (p95) | — | 5376.84 ms | — |
+| `tools/list` payload size (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
 
-Peak RSS after the 100-session run: 220 MiB (gateway and benchmark harness share the process). The high-concurrency p95 is dominated by the synchronous fail-closed audit write contending on the Postgres pool and by the per-session stdio subprocess model — the known ceilings in §10.
+Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms. Peak RSS after the 100-session run: 153 MiB (gateway and harness share the process); aggregate initialized upstream-container memory: 1,095 MiB. High-concurrency p95 includes Docker container ownership plus synchronous fail-closed audit writes contending on the Postgres pool.
 
 These numbers are published in the README with the exact commit and date they were measured at, so a stale claim is visible as stale rather than quietly wrong.
 
-**Reproduce:** `docker compose up -d postgres redis && .venv/bin/python -m tests.benchmarks.run` (wipes the local dev audit chain, like the integration tests; per-run reports land in gitignored `tests/benchmarks/reports/`).
+**Reproduce:** `docker build -t portunusmcp:dev .`, start Postgres/Redis, then run `UPSTREAM_RUNTIME_NAMESPACE=portunusmcp-benchmark .venv/bin/python -m tests.benchmarks.run` (wipes local dev state; reports land in gitignored `tests/benchmarks/reports/`).
 
 - **CI integration:** the benchmark suite runs on every merge to `main` (not every PR, to keep CI fast) and the report is uploaded as a build artifact so latency regressions are visible over time, even without a full dashboard.
 
@@ -577,10 +605,10 @@ These numbers are published in the README with the exact commit and date they we
 
 This project runs as a single instance for the portfolio demo, but the design should hold up under discussion about what changes at 10 / 100 / 1,000 / 10,000 concurrent sessions:
 
-- **The gateway itself is stateless** — no in-process session state that isn't already externalized to Redis/Postgres — so horizontal scaling is just running more replicas behind a load balancer (see the deployment diagram below). This is the main reason state was pushed out to Redis/Postgres from day one rather than kept in-memory.
+- **The current gateway is single-replica.** Session state and Docker container handles are in memory, and the audit chain has one safe writer. Redis/Postgres hold durable shared state, but that alone does not make horizontal scaling turnkey.
 - **Postgres write amplification is the first real bottleneck**, though it's addressed for v1 rather than deferred entirely: the naive approach (`SELECT MAX(seq)` before every insert to compute the next hash) is fixed by caching `latest_audit_hash` in Redis so the read is removed from the hot path, while the Postgres write itself remains synchronous to preserve the fail-closed audit guarantee (see §4.8, Audit Log). At scale well beyond a portfolio demo, this still eventually needs either a single-writer audit service that other gateway replicas call into, or periodic chain-checkpointing instead of chaining every single row — but the Redis-cache fix is sufficient for the load levels this project is actually built and benchmarked against. The multi-replica hazard is no longer just suspected: a two-writer variant of item 23's `test_concurrent_audit_writes_do_not_collide` demonstrated the chain forking experimentally — the Postgres insert commits before the Redis pointer CAS, so a `WatchError` retry orphans the already-committed row (148 rows for 100 writes) — which is why the single-writer audit service (or chain checkpointing) is a prerequisite for scaling gateway replicas that write audit rows, not an optional optimization.
 - **Redis is the second consideration** — replay-nonce sets and rate-limit counters are high-churn but low-value-per-key, which is exactly what Redis is good at; at very high scale this becomes a cluster-mode Redis deployment rather than a single instance, which is a config change, not an architecture change.
-- **Async worker pool sizing / connection pooling** — the gateway's upstream connections to MCP servers (especially stdio subprocesses) don't multiplex the way HTTP connections do; each session effectively owns a subprocess. At high concurrency this becomes the actual ceiling, not CPU — worth stating plainly rather than implying the system scales linearly forever.
+- **Container launch and connection ownership** — each local session owns a Docker container and stdio attachment. Launch latency and aggregate container memory become explicit ceilings at high concurrency; these are measured at 10/50/100 sessions in §9.
 
 None of this is built or load-tested at those scales for v1 — it's written here so a technical reviewer sees the bottlenecks were considered, not undiscovered.
 
@@ -588,8 +616,11 @@ None of this is built or load-tested at those scales for v1 — it's written her
 
 ## 11. Testing Strategy
 
-- **Unit:** policy resolution logic (RBAC + ABAC condition evaluation), schema hashing and diff classification, risk scoring function, param validator edge cases (nested objects, arrays, unicode).
-- **Integration:** spin up the gateway + a real (mock) MCP server in Compose, drive full `initialize → tools/list → tools/call` sequences via the actual MCP client SDK.
+- **Unit:** policy resolution logic (RBAC + ABAC condition evaluation), duplicate identity/index rejection, schema hashing and diff classification, risk scoring function, param validator edge cases (nested objects, arrays, unicode).
+- **Integration:** spin up the gateway + a real (mock) MCP server in Compose, drive full `initialize → tools/list → tools/call` sequences via the actual MCP client SDK; prove failed credentials throttle only their resolved source and leave a victim source's live risk unchanged.
+- **Production Compose:** render the digest-only production contract, then use local-image test overrides to boot its core + monitoring services, assert isolation/hardening, and drive `initialize → tools/list → tools/call` through the real per-session container runtime.
+- **Operator lifecycle:** live tests cover approval/baseline list-detail-approve, policy validate/simulate/rollout/rollback, old-key-signed rotation, multi-key export verification, the installed CLI as a subprocess, and journal recovery boundaries.
+- **Resource/lifecycle:** `tests/integration/test_resource_limits.py` uses a tiny async sleep tool to cover declared and streamed body limits, JSON depth/encoding/model validation, SDK Host/Origin checks, session/in-flight/rate boundaries and failure semantics, deadline reaping, and in-flight idle heartbeats. `tests/unit/test_readiness.py` covers named dependency/signing failures and the one overall readiness deadline; metrics tests prove arbitrary denied names collapse to `tool="other"`.
 - **Adversarial suite (this is your differentiator in interviews):**
   - Simulate a rug pull at each severity tier: description-only change (should not block), required-field change (should block), tool rename (should block as new/unapproved) — assert correct classification and correct action per tier.
   - Simulate tool poisoning: inject adversarial text into a tool description, assert the gateway doesn't execute anything based on description content (it shouldn't — description is passed through to the client only after prune, never executed).
@@ -617,7 +648,7 @@ jobs:
   test:       pytest --cov=services --cov-fail-under=80
   benchmark:  runs on merge to main only, uploads latency report artifact
   build:      docker build (multi-stage, non-root final image)
-  push:       on tag → push to GHCR/ECR
+  push:       on tag → push to GHCR and publish the immutable digest in the job summary
 ```
 
 ---
@@ -627,10 +658,8 @@ jobs:
 
 ## 13. Deployment
 
-- **MVP (Phase 1-2):** `docker-compose.yml` with gateway, Postgres, Redis, and the two `sample_target` demo servers — one command to get the full demo running. This is the only deployment target until the gateway logic itself is done and tested; infra work is explicitly sequenced *after*, not in parallel, so effort isn't split.
-- **Post-MVP (Phase 3+):** Terraform provisions VPC, RDS Postgres (encrypted at rest), ElastiCache Redis, an ECS Fargate service behind an ALB with TLS termination, secrets pulled from AWS Secrets Manager at container start — never baked into the image. Kubernetes/EKS is deliberately **not** built for v1 (see ADR-005) — Compose + ECS demonstrates the same infra literacy without the operational overhead of a K8s cluster for a single-service proxy.
-- **Distributed gateway note (documented, not built):** a production deployment of this pattern would run multiple stateless gateway replicas behind a load balancer, all reading from a shared Postgres policy/audit store and a shared Redis for replay-nonce and rate-limit state — the gateway holds no local state that isn't already externalized, so horizontal scaling is architecturally straightforward even though this repo only runs a single instance. This is covered as a diagram in `ARCHITECTURE.md`, not implemented, since a solo portfolio project gains little from actually standing up multi-node coordination.
+- **Demo:** `compose.demo.yml` is explicitly unsafe and local-only: default credentials, published data ports, rogue mutation service, tag-pinned images, and optional anonymous monitoring.
+- **Production:** `compose.prod.yml` is the one supported self-hosted deployment: a hardened single-replica gateway/verifier plus local Postgres/Redis, one-shot migrations, digest-pinned images, writable operator-owned policy/audit-key roots, internal data networking, and optional secured monitoring. The verifier sees only the public keyring. TLS termination, backups, host hardening, log shipping, and an explicit Uvicorn `FORWARDED_ALLOW_IPS` value matching the TLS proxy are operator responsibilities.
+- **Not built:** Terraform/ECS, remote network upstreams, inter-service mTLS, and multi-replica gateway coordination. Multiple replicas are unsafe until session/container ownership is externalized and the audit chain has a distributed atomic writer. Kubernetes remains deliberately out of v1 (ADR-005).
 
 ---
-
-

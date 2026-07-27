@@ -2,8 +2,8 @@
 
 **Status:** Accepted
 
-**Decision:** Use Redis for replay-nonce tracking, rate-limit counters, session idle-timeout TTLs, the cached `latest_audit_hash` chain pointer, and risk-decay calibration counters.
+**Decision:** Use Redis for replay-nonce tracking, per-identity tool-call and source-auth-failure rate counters, session idle-timeout TTLs, the cached `latest_audit_hash` chain pointer, risk-decay calibration counters, and one-time step-up challenges. The production Compose profile enables AOF with `appendfsync everysec`; demo/test Redis remains disposable.
 
-**Reasoning:** This state is high-churn and short-TTL, and non-durable-by-design in a way that's acceptable — a lost nonce cache just means a slightly wider replay window until it repopulates, not a security failure or data loss. This is a good fit for Redis's operational model, and keeps write pressure off the durability-critical audit log in Postgres, which has a stricter guarantee to uphold (see `THREAT_MODEL.md` and the Failure Modes section of `ARCHITECTURE.md`).
+**Reasoning:** This state is high-churn and mostly short-TTL. Its correctness posture already fails closed while Redis is unavailable, but losing recent state across a routine container replacement unnecessarily drops nonce, rate, session, and challenge history. AOF reduces that operational loss window without promoting Redis to the durability-critical system of record; `everysec` can still lose roughly one second after a host failure. PostgreSQL remains the durable store for the signed audit chain, baselines, policy versions, approvals, and verifier checkpoint.
 
-**Alternatives considered:** Keeping this state in Postgres alongside the audit log; in-process memory (rejected — breaks statelessness required for multi-replica deployment, see `ARCHITECTURE.md` §4.5).
+**Alternatives considered:** Keeping all high-churn state in Postgres alongside the audit log; ephemeral production Redis; `appendfsync always`. Redis does not make the gateway stateless: session objects and Docker container handles remain in memory, and the audit chain still has one safe writer, so production is explicitly one gateway replica.

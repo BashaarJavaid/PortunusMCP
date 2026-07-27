@@ -1,4 +1,5 @@
 import secrets
+import shlex
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -28,7 +29,9 @@ def upstream_command(mutation: str) -> str:
 def set_mutation(mutation: str) -> None:
     """Later sessions spawn the mutated upstream — the rug pull, operator-triggered.
     Rewrites the live registry entry (item 35); tests run the app in-process."""
-    app.state.policy_store.engine.policy.servers["default"] = upstream_command(mutation)
+    app.state.policy_store.engine.policy.servers["default"].command = shlex.split(
+        upstream_command(mutation)
+    )
 
 
 @pytest.fixture

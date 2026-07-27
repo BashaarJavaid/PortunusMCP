@@ -9,6 +9,7 @@ Keypair is minted once via scripts/generate_signing_key.py; loaders raise on a
 missing or invalid file so the gateway fails startup (§5, fail closed).
 """
 
+import hashlib
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
@@ -41,3 +42,30 @@ def verify(public_key: ec.EllipticCurvePublicKey, signature: bytes, curr_hash: s
     except InvalidSignature:
         return False
     return True
+
+
+def generate_private_key() -> ec.EllipticCurvePrivateKey:
+    return ec.generate_private_key(ec.SECP256R1())
+
+
+def private_pem(private_key: ec.EllipticCurvePrivateKey) -> bytes:
+    return private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+def public_pem(public_key: ec.EllipticCurvePublicKey) -> bytes:
+    return public_key.public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def key_id(public_key: ec.EllipticCurvePublicKey) -> str:
+    der = public_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return f"sha256:{hashlib.sha256(der).hexdigest()}"

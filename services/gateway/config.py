@@ -2,11 +2,12 @@
 
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Defaults are local-dev only; docker-compose.yml / .env override them.
+    # Defaults are local-dev only; the explicit demo/production Compose envs override them.
     database_url: str = "postgresql+asyncpg://portunusmcp:portunusmcp@localhost:5432/portunusmcp"
     redis_url: str = "redis://localhost:6379/0"
     policy_file: str = "policies/example-policy.yaml"
@@ -15,11 +16,27 @@ class Settings(BaseSettings):
     schema_cache_ttl: int = 600
     session_idle_ttl: int = 300
     shutdown_grace_seconds: int = 5
+    max_mcp_body_bytes: int = Field(default=1048576, gt=0)
+    max_json_depth: int = Field(default=32, gt=0)
+    max_sessions_per_identity: int = Field(default=3, gt=0)
+    max_inflight_calls_per_identity: int = Field(default=5, gt=0)
+    tool_call_rate_limit: int = Field(default=60, gt=0)
+    tool_call_rate_window_seconds: int = Field(default=60, gt=0)
+    auth_failure_rate_limit: int = Field(default=5, gt=0)
+    auth_failure_rate_window_seconds: int = Field(default=300, gt=0)
+    tool_call_deadline_seconds: int = Field(default=60, gt=0)
+    readiness_timeout_seconds: float = Field(default=1.0, gt=0)
+    allowed_hosts: list[str] = ["localhost:*", "127.0.0.1:*"]
+    allowed_origins: list[str] = []
     # Half-width of the Replay Guard's accepted timestamp window (±30s, §4.8).
     replay_window_seconds: int = 30
     # Audit-log ECDSA keypair (§4.8): minted via scripts/generate_signing_key.py.
     # A gateway with no usable private key must not start (§5, fail closed).
     signing_key_file: str = "secrets/audit_signing_key.pem"
+    signing_public_keys_dir: str = "secrets/public"
+    # Compatibility path for callers that still need the pre-item-42 single public
+    # key during the explicit production-directory migration. The gateway/verifier
+    # use signing_public_keys_dir.
     signing_public_key_file: str = "secrets/audit_signing_key.pub.pem"
     # Risk Engine v1 (§4.8, item 16). Business hours are Mon-Fri in UTC — v1 has no
     # per-identity timezone; a policy timezone field is a documented later extension.
@@ -38,10 +55,6 @@ class Settings(BaseSettings):
     # collects more than this many DENY_* terminals within the window.
     risk_denial_window_seconds: int = 600
     risk_denial_threshold: int = 3
-    # Auth-failure factor: one gateway-wide counter of failed API-key lookups; fires
-    # for every identity while more than this many failures sit within the window.
-    risk_auth_failure_window_seconds: int = 300
-    risk_auth_failure_threshold: int = 5
     # Drift-history factor: fires when a tool has this many DRIFT_* audit events in
     # the window, even if re-approved ("changed shape twice in the last week").
     risk_drift_history_window_seconds: int = 604800
@@ -63,7 +76,7 @@ class Settings(BaseSettings):
     metrics_port: int = 9100
     # Bind address for that listener. Loopback by default so a gateway run directly
     # on a host does not expose identity ids and tool names on every interface;
-    # compose sets METRICS_HOST=0.0.0.0, where container network isolation (the port
+    # Compose sets METRICS_HOST=0.0.0.0, where container network isolation (the port
     # is deliberately not published) is the boundary instead.
     metrics_host: str = "127.0.0.1"
 

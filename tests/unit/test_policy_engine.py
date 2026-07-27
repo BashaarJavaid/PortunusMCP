@@ -8,7 +8,8 @@ from pydantic import ValidationError
 from services.gateway import policy_engine
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
 
-SERVERS = {"github": "unused-command", "filesystem": "unused-command"}
+SERVER = {"image": "example/upstream:test", "command": ["unused-command"]}
+SERVERS = {"github": SERVER, "filesystem": SERVER}
 
 
 def make_engine(identities: list[dict]) -> PolicyEngine:
@@ -124,13 +125,82 @@ def test_grant_naming_unregistered_server_fails_load() -> None:
 
 def test_wildcard_is_not_a_registrable_server_id() -> None:
     with pytest.raises(ValidationError, match="not a registrable"):
-        PolicyFile.model_validate({"version": 1, "servers": {"*": "cmd"}, "identities": []})
+        PolicyFile.model_validate({"version": 1, "servers": {"*": SERVER}, "identities": []})
 
 
-def test_server_command_resolves_registered_servers() -> None:
+def test_server_config_resolves_registered_servers() -> None:
     engine = make_engine([READONLY])
-    assert engine.server_command("github") == "unused-command"
-    assert engine.server_command("nope") is None
+    assert engine.server_config("github") is not None
+    assert engine.server_config("github").command == ["unused-command"]  # type: ignore[union-attr]
+    assert engine.server_config("nope") is None
+
+
+def test_legacy_string_server_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        PolicyFile.model_validate(
+            {"version": 1, "servers": {"github": "unused-command"}, "identities": []}
+        )
+
+
+def test_upstream_environment_is_explicit_and_secret_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PORTUNUSMCP_UPSTREAM_TOKEN", "upstream-only")
+    policy = PolicyFile.model_validate(
+        {
+            "version": 1,
+            "servers": {
+                "github": {
+                    **SERVER,
+                    "env": {"TOKEN": "PORTUNUSMCP_UPSTREAM_TOKEN"},
+                }
+            },
+        }
+    )
+    assert policy.servers["github"].resolved_environment == {"TOKEN": "upstream-only"}
+    assert "upstream-only" not in policy.model_dump_json()
+
+
+def test_upstream_environment_rejects_gateway_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "secret")
+    with pytest.raises(ValidationError, match="must start"):
+        PolicyFile.model_validate(
+            {
+                "version": 1,
+                "servers": {
+                    "github": {
+                        **SERVER,
+                        "env": {"DATABASE_URL": "DATABASE_URL"},
+                    }
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["/app/secrets", "/app/secrets/key", "/var/run/docker.sock", "/safe/../app/secrets"],
+)
+def test_upstream_mount_rejects_reserved_targets(target: str) -> None:
+    with pytest.raises(ValidationError, match="reserved|must not contain"):
+        PolicyFile.model_validate(
+            {
+                "version": 1,
+                "servers": {
+                    "github": {
+                        **SERVER,
+                        "volumes": [
+                            {
+                                "source": "portunusmcp-upstream-test-data",
+                                "target": target,
+                            }
+                        ],
+                    }
+                },
+            }
+        )
 
 
 def test_matching_grant_none_when_rbac_denies() -> None:
@@ -252,3 +322,75 @@ def test_existing_bearer_yaml_shape_still_loads() -> None:
     engine = make_engine([READONLY])
     identity = engine.identity("agent-readonly")
     assert identity is not None and identity.auth_mode == "bearer"
+
+
+# --- identity index collision validation (item 43) ---
+
+
+def test_duplicate_identity_id_fails_with_positions() -> None:
+    with pytest.raises(
+        ValidationError,
+        match=r"duplicate identity id 'same' at identities\[0\] and identities\[1\]",
+    ):
+        make_engine(
+            [
+                {"id": "same", "api_key_hash": "sha256:first"},
+                {"id": "same", "api_key_hash": "sha256:second"},
+            ]
+        )
+
+
+def test_duplicate_api_key_hash_names_both_identities() -> None:
+    with pytest.raises(
+        ValidationError,
+        match=r"duplicate api_key_hash 'sha256:same' for identities 'first' and 'second'",
+    ):
+        make_engine(
+            [
+                {"id": "first", "api_key_hash": "sha256:same"},
+                {"id": "second", "api_key_hash": "sha256:same"},
+            ]
+        )
+
+
+def test_duplicate_signed_key_id_names_both_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLICY_TEST_SECRET_A", "secret-a")
+    monkeypatch.setenv("POLICY_TEST_SECRET_B", "secret-b")
+    with pytest.raises(
+        ValidationError,
+        match=r"duplicate key_id 'kid_same' for identities 'first' and 'second'",
+    ):
+        make_engine(
+            [
+                {
+                    "id": "first",
+                    "auth_mode": "signed",
+                    "key_id": "kid_same",
+                    "signing_secret_env": "POLICY_TEST_SECRET_A",
+                },
+                {
+                    "id": "second",
+                    "auth_mode": "signed",
+                    "key_id": "kid_same",
+                    "signing_secret_env": "POLICY_TEST_SECRET_B",
+                },
+            ]
+        )
+
+
+def test_policy_store_keeps_last_known_good_on_duplicate_identity(tmp_path: Path) -> None:
+    path = tmp_path / "policy.yaml"
+    path.write_text("version: 1\nidentities: []\n")
+    store = policy_engine.PolicyStore(path)
+    path.write_text(
+        """
+version: 2
+identities:
+  - {id: duplicate, api_key_hash: "sha256:first"}
+  - {id: duplicate, api_key_hash: "sha256:second"}
+"""
+    )
+    assert store.reload() is False
+    assert store.engine.version == 1

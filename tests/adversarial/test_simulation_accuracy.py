@@ -18,7 +18,13 @@ import yaml
 from sqlalchemy import select, text
 
 from services.gateway.db import AuditLog, async_session
-from tests.integration.conftest import ECHO_SERVER, Gateway, _key_hash, running_gateway
+from tests.integration.conftest import (
+    ECHO_SERVER,
+    Gateway,
+    _key_hash,
+    running_gateway,
+    server_spec,
+)
 from tests.integration.test_policy_scoping import connect
 from tests.integration.test_policy_simulation import _seed_revision, _window
 
@@ -29,7 +35,7 @@ def _policy(keys: dict[str, str], version: int, conditions: list[str] | None = N
         grant["conditions"] = conditions
     return {
         "version": version,
-        "servers": {"default": f"{sys.executable} {ECHO_SERVER}"},
+        "servers": {"default": server_spec(f"{sys.executable} {ECHO_SERVER}")},
         "identities": [
             {
                 "id": "agent",

@@ -1,0 +1,9 @@
+groups:
+  - name: portunusmcp
+    rules:
+      - alert: PortunusMCPAuthSourceBlocked
+        expr: increase(portunusmcp_auth_throttled_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: PortunusMCP blocked credential attempts from a source

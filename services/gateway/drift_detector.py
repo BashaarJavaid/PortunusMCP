@@ -201,6 +201,8 @@ class DriftDetector:
                         row.observed_hash = None
                         row.observed_schema = None
                         row.blocked = False
+                        if not row.suspicious:
+                            row.flagged_at = None
                     continue
                 if live_hash == row.observed_hash:
                     continue  # this exact drift is already logged
@@ -220,6 +222,7 @@ class DriftDetector:
                 metrics.SCHEMA_DRIFT.labels(server_id, name, severity.name.lower()).inc()
                 row.observed_schema = tool
                 row.observed_hash = live_hash
+                row.flagged_at = row.flagged_at or datetime.now(UTC)
                 if severity.blocks:
                     row.blocked = True
 
@@ -237,6 +240,7 @@ class DriftDetector:
                     metrics.SCHEMA_DRIFT.labels(server_id, name, "medium").inc()
                     row.observed_hash = REMOVED_SENTINEL
                     row.observed_schema = None
+                    row.flagged_at = row.flagged_at or datetime.now(UTC)
             await session.commit()
 
     async def _first_sighting(
@@ -280,6 +284,7 @@ class DriftDetector:
                     approved_schema=tool,
                     approved_hash=live_hash,
                     suspicious=bool(findings),
+                    flagged_at=datetime.now(UTC) if findings else None,
                 )
             )
             return
@@ -308,6 +313,7 @@ class DriftDetector:
                 observed_schema=tool,
                 observed_hash=live_hash,
                 suspicious=bool(findings),
+                flagged_at=datetime.now(UTC),
             )
         )
 
@@ -373,10 +379,12 @@ class DriftDetector:
         pending drift to approve."""
         async with self._sessions() as session:
             result = await session.execute(
-                select(ToolBaseline).where(
+                select(ToolBaseline)
+                .where(
                     ToolBaseline.server_id == server_id,
                     ToolBaseline.tool_name == tool_name,
                 )
+                .with_for_update()
             )
             row = result.scalar_one_or_none()
             if row is None or row.observed_schema is None:
@@ -399,6 +407,8 @@ class DriftDetector:
                     payload_extra={"findings": findings},
                 )
             row.suspicious = bool(findings)
+            if not row.suspicious:
+                row.flagged_at = None
             seq = await self._writer.write(
                 EventType.APPROVED,
                 approved_by,

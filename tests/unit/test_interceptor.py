@@ -24,7 +24,7 @@ logging_config.configure()
 POLICY = PolicyFile.model_validate(
     {
         "version": 1,
-        "servers": {"default": "unused-command"},
+        "servers": {"default": {"image": "example/upstream:test", "command": ["unused-command"]}},
         "identities": [
             {
                 "id": "agent-readonly",
@@ -207,7 +207,9 @@ def abac_policy(conditions: list[str], attributes: dict[str, Any] | None = None)
     return PolicyFile.model_validate(
         {
             "version": 1,
-            "servers": {"default": "unused-command"},
+            "servers": {
+                "default": {"image": "example/upstream:test", "command": ["unused-command"]}
+            },
             "identities": [
                 {
                     "id": "agent-readonly",
@@ -496,7 +498,9 @@ async def test_signed_identity_missing_nonce_is_denied() -> None:
     policy = PolicyFile.model_validate(
         {
             "version": 1,
-            "servers": {"default": "unused-command"},
+            "servers": {
+                "default": {"image": "example/upstream:test", "command": ["unused-command"]}
+            },
             "identities": [
                 {
                     "id": "agent-readonly",

@@ -3,6 +3,7 @@ RBAC granted on server A must not allow the tool on server B, drift on A must no
 block B, and an unregistered server id is a 404."""
 
 import secrets
+import shlex
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -85,7 +86,10 @@ async def test_rbac_is_isolated_per_server(multi_gateway: Gateway) -> None:
 async def test_unregistered_server_id_is_404(multi_gateway: Gateway) -> None:
     headers = {"X-PortunusMCP-Key": multi_gateway.keys["full"]}
     async with httpx.AsyncClient(headers=headers) as client:
-        response = await client.post(f"{multi_gateway.url}/mcp/gamma", json={})
+        response = await client.post(
+            f"{multi_gateway.url}/mcp/gamma",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
         assert response.status_code == 404
 
 
@@ -96,7 +100,9 @@ async def test_drift_on_one_server_does_not_block_the_other(multi_gateway: Gatew
             await session.list_tools()
 
     # Rug-pull beta only (Critical: required status flipped) via the live registry.
-    app.state.policy_store.engine.policy.servers["beta"] = upstream_command("required_change")
+    app.state.policy_store.engine.policy.servers["beta"].command = shlex.split(
+        upstream_command("required_change")
+    )
     async with connect_to(multi_gateway.url, "beta", multi_gateway.keys["full"]) as session:
         await session.list_tools()
         with pytest.raises(McpError) as excinfo:

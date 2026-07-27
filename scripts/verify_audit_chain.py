@@ -24,36 +24,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sqlalchemy import select  # noqa: E402
 
-from services.gateway import signing  # noqa: E402
-from services.gateway.audit_log import GENESIS_HASH, compute_hash  # noqa: E402
+from services.gateway.audit_export import verify_file  # noqa: E402
+from services.gateway.audit_keys import AuditKeyStore  # noqa: E402
+from services.gateway.audit_log import GENESIS_HASH  # noqa: E402
+from services.gateway.audit_verification import AuditRecord, verify_record  # noqa: E402
 from services.gateway.config import settings  # noqa: E402
 from services.gateway.db import AuditLog, async_session, engine  # noqa: E402
 from services.gateway.policy_versions import snapshot_path  # noqa: E402
 
 
 async def verify() -> int:
-    public_key = None
-    if Path(settings.signing_public_key_file).exists():
-        public_key = signing.load_public_key(settings.signing_public_key_file)
-    else:
-        print(f"no public key at {settings.signing_public_key_file}; skipping signature checks")
+    key_store = AuditKeyStore(settings.signing_key_file, settings.signing_public_keys_dir)
     prev_hash = GENESIS_HASH
     count = 0
     async with async_session() as session:
         rows = await session.stream_scalars(select(AuditLog).order_by(AuditLog.seq))
         async for row in rows:
-            if row.prev_hash != prev_hash:
-                print(f"BROKEN LINK at seq={row.seq}: prev_hash does not continue the chain")
+            try:
+                prev_hash = verify_record(
+                    AuditRecord.from_row(row), prev_hash, key_store.load_public
+                )
+            except ValueError as exc:
+                print(exc)
                 return 1
-            if compute_hash(prev_hash, row.payload) != row.curr_hash:
-                print(f"TAMPERED ROW at seq={row.seq}: payload does not match curr_hash")
-                return 1
-            if public_key is not None and not signing.verify(
-                public_key, row.signature, row.curr_hash
-            ):
-                print(f"BAD SIGNATURE at seq={row.seq}: curr_hash was not signed by the gateway")
-                return 1
-            prev_hash = row.curr_hash
             count += 1
     print(f"chain OK ({count} rows)")
     return 0
@@ -95,7 +88,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--diff-policy", nargs=2, metavar=("OLD", "NEW"))
     parser.add_argument("--html", action="store_true", help="side-by-side HTML diff page")
+    parser.add_argument("--export", metavar="FILE", help="verify an exported NDJSON chain")
     args = parser.parse_args()
+    if args.export:
+        if args.diff_policy or args.html:
+            parser.error("--export cannot be combined with policy diff flags")
+        try:
+            count, anchored = verify_file(args.export)
+        except ValueError as exc:
+            print(exc)
+            sys.exit(1)
+        qualifier = "genesis anchored" if anchored else "prefix omitted/unattested"
+        print(f"export OK ({count} rows, {qualifier})")
+        sys.exit(0)
     if args.diff_policy:
         sys.exit(diff_policy(*args.diff_policy, html=args.html))
     if args.html:
