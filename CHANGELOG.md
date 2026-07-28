@@ -11,6 +11,10 @@ All notable changes are documented here. The format follows
 - Added `portunusmcp quickstart`, a non-interactive, installed-CLI path from a local
   stdio MCP image to independently verified canonical `ALLOW` and `DENY_RBAC`
   Decisions on a generated loopback-only hardened stack.
+- Added restart-required `ENFORCEMENT_MODE=enforce|observe`. Observe runs the complete
+  call pipeline, audits the earliest would-be Decision with downstream risk data, and
+  forwards only after that audit succeeds; auth, resource/rate, deadline, upstream,
+  and audit gates remain enforcing.
 
 ## [0.1.0] - 2026-07-27
 

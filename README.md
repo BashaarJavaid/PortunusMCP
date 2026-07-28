@@ -138,18 +138,18 @@ The full version, including the assumptions the whole model rests on, is in [`TH
 
 | Threat | Protected? | How / why not |
 |---|---|---|
-| Unauthorized tool access by a known identity | Yes | RBAC + ABAC policy resolution |
-| Rogue / rug-pulling MCP server (schema mutation) | Yes | Drift Detector classifies mutations; High/Critical blocks at `tools/call` until re-approval |
-| Contextually risky calls by an *authorized* identity | Yes | Risk Engine — challenge / human approval / deny, by score band |
+| Unauthorized tool access by a known identity | **Enforce: Yes; Observe: No** | RBAC + ABAC block in `enforce`; `observe` audits the would-be denial and forwards |
+| Rogue / rug-pulling MCP server (schema mutation) | **Enforce: Yes; Observe: detects only** | Drift Detector classifies mutations; High/Critical blocks until re-approval only in `enforce` |
+| Contextually risky calls by an *authorized* identity | **Enforce: Yes; Observe: advisory** | Risk Engine computes the same score and outcome in both modes; only `enforce` holds or denies |
 | Audit-log tampering | Yes | Hash chain + per-row ECDSA signature; independently verified by a sidecar holding only the public key |
-| Replay of a captured request | **Yes for `signed` / Partial for `bearer`** | A `signed` request carries no credential: a byte-identical replay is deduped (`DENY_REPLAY`) and a fresh nonce cannot be re-signed (401 at the edge). `bearer` keeps opportunistic dedup only — the API key travels in the captured request |
-| Tool Poisoning (adversarial text in descriptions) | **Partial** | A description changed after approval blocks until re-approval (default High, item 36a); first-contact baselines are heuristically scanned — a hit is audited (`BASELINE_FLAGGED`) and raises every later call's risk, but flags never block and novel phrasing evades pattern lists. Descriptions still reach the LLM verbatim — Partial is the ceiling |
+| Replay of a captured request | **Enforce: Yes for `signed` / Partial for `bearer`; Observe: detects only** | The nonce check still runs and consumes nonces in `observe`, but a detected replay is forwarded. HTTP signature failures remain 401 in both modes |
+| Tool Poisoning (adversarial text in descriptions) | **Enforce: Partial; Observe: weaker advisory detection** | Changed descriptions block only in `enforce`; `observe` still scans, audits, and scores but forwards. Descriptions reach the LLM verbatim in both modes |
 | Compromised registered upstream reading gateway secrets | **Yes (scoped)** | Per-session hardened containers receive a minimal allowlisted environment and no gateway secrets directory, Docker socket, or DB/Redis credentials; host/gateway compromise remains out of scope |
 | DNS rebinding against Streamable HTTP | **Yes (scoped)** | The MCP SDK validates every `/mcp/*` Host and supplied Origin against configured allowlists before auth or parsing; the deployment must configure its real public names |
 | Authenticated resource exhaustion / stuck tools | **Partial** | Per-identity sessions, in-flight calls, fixed-window rate limits, bounded bodies/depth, and a 60s call deadline cap one identity; many identities can still exhaust the host, and a deadline cannot undo an upstream side effect already started |
 | Unauthenticated credential stuffing / auth-path availability | **Partial** | Bad bearer/signed credentials are fixed-window throttled by trusted-proxy-resolved source across MCP/admin and raise an alert; address rotation, initial concurrent bursts, and shared-NAT collateral remain |
 | Prompt injection via tool *results* | Partial | A protocol-layer gateway can log and rate-limit but not semantically evaluate result content — client/agent-framework responsibility |
-| Stolen API key | Partial | Behavioral risk factors reduce blast radius; a key alone can't be distinguished from its holder. A `signed` identity's secret never appears on the wire at all — stealing it means compromising a host environment |
+| Stolen API key | Partial | Source throttling remains active in both modes; behavioral risk blocks only in `enforce`. A `signed` identity's secret never appears on the wire at all |
 | Compromised gateway host | No | The attacker has the signing key — an infra hardening problem, not an application one |
 | Insider admin abusing legitimate access | No | Attributable and tamper-evident after the fact, not prevented; two-person activation is designed, not built |
 
@@ -252,16 +252,30 @@ If later demo policy v1 content conflicts with recorded state, the fail-closed a
 
 `compose.prod.yml` is a hardened **single-host, single-gateway-replica** profile. It is intentionally not selected by a bare `docker compose up`: every invocation names the production file and env explicitly.
 
+> **Warning:** `ENFORCEMENT_MODE=observe` forwards calls that RBAC, ABAC, replay,
+> drift, risk, or parameter validation would deny. Use it only to learn policy impact;
+> authenticated source/tool rate limits, session/resource limits, deadlines, upstream
+> availability, and audit-before-action remain enforcing.
+
 ```bash
 cp .env.prod.example .env.prod
 cp .env.prod.gateway.example .env.prod.gateway
 chmod 600 .env.prod .env.prod.gateway
 # Fill every required password, digest, allowlist, path, namespace and Docker GID.
+# Keep ENFORCEMENT_MODE=enforce, or deliberately set observe for an audit-only trial.
 
 docker compose --env-file .env.prod -f compose.prod.yml config
 docker compose --env-file .env.prod -f compose.prod.yml pull
 docker compose --env-file .env.prod -f compose.prod.yml up -d
 ```
+
+`ENFORCEMENT_MODE` is process-wide and accepts only `enforce` or `observe`. The
+bare-host and demo defaults are `enforce`; production Compose refuses to render
+without an explicit value. Switching mode requires recreating/restarting the gateway:
+changing policy or sending SIGHUP does not change it. In observe mode `tools/list`
+serves the full upstream list, and each `tools/call` audit Decision records
+`"mode":"observe"` plus the earliest would-be terminal and downstream risk score/factors.
+The upstream result itself is returned unchanged.
 
 The tagged production bundle fills every service image with the exact manifest digest
 tested by the release workflow; the source-tree env example keeps placeholders for
@@ -298,6 +312,7 @@ The item-40/43 edge settings are environment-backed; all numeric values must be 
 
 | Setting | Default |
 |---|---:|
+| `ENFORCEMENT_MODE` | `enforce` (explicitly required by production Compose) |
 | `MAX_MCP_BODY_BYTES` | `1048576` |
 | `MAX_JSON_DEPTH` | `32` |
 | `MAX_SESSIONS_PER_IDENTITY` | `3` |
@@ -391,7 +406,7 @@ Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms
 
 Phases 1–6 are complete. The Phase 7 blockers (items 44–47) are also complete: [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 48, `portunusmcp quickstart`, is next.
 
-Items through Phase 6 are complete only when their verification passes and the corresponding threat-model claim is earned. Phase 7 does not upgrade threat-model rows; its adoption items verify against observed friction and the phase closes after five outside users complete `quickstart` and their friction is triaged.
+Items through Phase 6 are complete only when their verification passes and the corresponding threat-model claim is earned. Phase 7 verifies against observed friction; item 49's observe mode is the explicit exception that weakens and therefore qualifies existing threat-model claims. The phase closes after five outside users complete `quickstart` and their friction is triaged.
 
 ## License
 

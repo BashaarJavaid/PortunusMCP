@@ -9,10 +9,11 @@ from typing import Any, cast
 import pytest
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
+from prometheus_client import REGISTRY
 
 from services.gateway import logging_config, risk_engine
 from services.gateway.approvals import APPROVAL_META_KEY
-from services.gateway.decision import DecisionOutcome, EventType
+from services.gateway.decision import DecisionMode, DecisionOutcome, EventType
 from services.gateway.jsonrpc_interceptor import Forward, Interceptor, Respond
 from services.gateway.policy_engine import PolicyEngine, PolicyFile
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
@@ -47,6 +48,7 @@ FAKE_HASH = "cafe" * 16
 class FakeWriter:
     def __init__(self) -> None:
         self.events: list[EventType] = []
+        self.rows: list[dict[str, Any]] = []
 
     async def write(
         self,
@@ -58,6 +60,13 @@ class FakeWriter:
         risk_score: int | None = None,
     ) -> int:
         self.events.append(event_type)
+        self.rows.append(
+            {
+                "event_type": event_type,
+                "payload": payload_extra or {},
+                "risk_score": risk_score,
+            }
+        )
         return 42
 
 
@@ -65,11 +74,13 @@ class FakeDetector:
     def __init__(self) -> None:
         self.blocked: set[str] = set()
         self.checked: list[list[dict[str, Any]]] = []
+        self.lookups: list[str] = []
 
     async def check(self, server_id: str, tools: list[dict[str, Any]], identity_id: str) -> None:
         self.checked.append(tools)
 
     async def is_blocked(self, server_id: str, tool_name: str) -> bool:
+        self.lookups.append(tool_name)
         return tool_name in self.blocked
 
 
@@ -111,6 +122,7 @@ class FakeRisk:
         self.error = error
         self.denials: list[str] = []
         self.denial_error: Exception | None = None
+        self.calls: list[str] = []
 
     async def score(
         self,
@@ -120,6 +132,7 @@ class FakeRisk:
         arguments: dict[str, Any],
         risk_policy: Any,
     ) -> tuple[int, list[Any]]:
+        self.calls.append(tool_name)
         if self.error is not None:
             raise self.error
         return self.result
@@ -133,6 +146,7 @@ class FakeRisk:
 class FakeApprovals:
     def __init__(self) -> None:
         self.redeemed: list[str] = []
+        self.created: list[str] = []
         self.denial: tuple[EventType, str] | None = None
 
     async def redeem(
@@ -144,12 +158,14 @@ class FakeApprovals:
     async def create(
         self, identity_id: str, server_id: str, tool_name: str, args_hash: str, audit_id: int
     ) -> str:
+        self.created.append(tool_name)
         return "approval-1"
 
 
 class FakeChallenges:
     def __init__(self) -> None:
         self.redeemed: list[str] = []
+        self.created: list[str] = []
         self.failure: str | None = None
 
     async def redeem(
@@ -168,6 +184,7 @@ class FakeChallenges:
     async def create(
         self, identity_id: str, server_id: str, tool_name: str, args_hash: str, audit_id: int
     ) -> str:
+        self.created.append(tool_name)
         return "challenge-1"
 
 
@@ -180,6 +197,7 @@ def make_interceptor(
     with_schema: bool = True,
     risk: FakeRisk | None = None,
     policy: PolicyFile | None = None,
+    mode: DecisionMode = DecisionMode.ENFORCE,
 ) -> tuple[Interceptor, FakeWriter, FakeCache, FakeDetector]:
     writer = FakeWriter()
     cache = FakeCache()
@@ -199,6 +217,7 @@ def make_interceptor(
         approvals=cast(Any, FakeApprovals()),
         challenges=cast(Any, FakeChallenges()),
         send_upstream=_no_upstream,
+        mode=mode,
     )
     return interceptor, writer, cache, detector
 
@@ -283,6 +302,7 @@ async def test_decision_log_lines_are_structured_with_session_correlation(
     for line in decisions:
         assert line["session_id"] == "test-session"
         assert line["identity"] == "agent-readonly"
+        assert line["mode"] == "enforce"
 
 
 async def test_unauthorized_tools_call_is_denied_with_canonical_decision() -> None:
@@ -296,6 +316,7 @@ async def test_unauthorized_tools_call_is_denied_with_canonical_decision() -> No
     assert error.id == 1
     assert error.error.data["event_type"] == "DENY_RBAC"
     assert error.error.data["decision"] == "deny"
+    assert error.error.data["mode"] == "enforce"
     assert error.error.data["policy_version"] == 1
     assert error.error.data["audit_id"] == "42"  # the audit row's seq
     assert writer.events == [EventType.DENY_RBAC]
@@ -443,7 +464,125 @@ async def test_tools_list_response_is_pruned_audited_and_etagged() -> None:
     assert out.message.root.result["_meta"] == {"etag": f"1-{FAKE_HASH}"}
     assert cache.data["default"] == [{"name": "echo"}, {"name": "delete_repo"}]
     assert writer.events == [EventType.TOOLS_LIST]
+    assert writer.rows[0]["payload"] == {
+        "mode": "enforce",
+        "served_tools": ["echo"],
+        "pruned_tools": ["delete_repo"],
+        "would_prune_tools": ["delete_repo"],
+    }
     assert detector.checked == [[{"name": "echo"}, {"name": "delete_repo"}]]  # full list
+
+
+async def test_observe_forwards_rbac_deny_after_remaining_stages_and_audit() -> None:
+    risk = FakeRisk()
+    interceptor, writer, _, detector = make_interceptor(risk=risk, mode=DecisionMode.OBSERVE)
+    message = request(
+        "tools/call",
+        {"name": "delete_repo", "arguments": {}, "_meta": fresh_meta()},
+    )
+
+    outcome = await interceptor.on_client_message(message)
+
+    assert isinstance(outcome, Forward)
+    assert detector.lookups == ["delete_repo"]
+    assert risk.calls == ["delete_repo"]
+    assert risk.denials == ["agent-readonly"]
+    assert writer.events == [EventType.DENY_RBAC]
+    assert writer.rows[0]["risk_score"] == 0
+    assert writer.rows[0]["payload"]["mode"] == "observe"
+    assert writer.rows[0]["payload"]["risk_factors"] == []
+    assert "_meta" not in message.message.root.params
+
+
+async def test_observe_tools_list_serves_all_and_records_would_be_pruning() -> None:
+    interceptor, writer, _, _ = make_interceptor(with_schema=False, mode=DecisionMode.OBSERVE)
+    await interceptor.on_client_message(request("tools/list", id=7))
+    response = SessionMessage(
+        JSONRPCMessage(
+            JSONRPCResponse(
+                jsonrpc="2.0",
+                id=7,
+                result={"tools": [{"name": "echo"}, {"name": "delete_repo"}]},
+            )
+        )
+    )
+
+    out = await interceptor.on_upstream_message(response)
+
+    assert out is not None
+    assert out.message.root.result["tools"] == [
+        {"name": "echo"},
+        {"name": "delete_repo"},
+    ]
+    assert writer.rows[0]["payload"] == {
+        "mode": "observe",
+        "served_tools": ["echo", "delete_repo"],
+        "pruned_tools": [],
+        "would_prune_tools": ["delete_repo"],
+    }
+
+
+async def test_observe_preserves_first_blocker_and_enriches_it_with_failed_risk() -> None:
+    policy = abac_policy(["identity.team == 'sales'"])
+    interceptor, writer, _, detector = make_interceptor(
+        policy=policy,
+        risk=FakeRisk(error=RuntimeError("redis down")),
+        mode=DecisionMode.OBSERVE,
+    )
+    detector.blocked.add("echo")
+
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"bogus": 1}})
+    )
+
+    assert isinstance(outcome, Forward)
+    assert writer.events == [EventType.DENY_ABAC]
+    row = writer.rows[0]
+    assert row["risk_score"] == 100
+    assert row["payload"]["risk_factors"][0]["factor"] == "risk_engine_unavailable"
+
+
+async def test_observe_ignores_hold_metadata_and_never_creates_or_consumes_holds() -> None:
+    interceptor, writer, _, _ = make_interceptor(risk=FakeRisk(75), mode=DecisionMode.OBSERVE)
+    approvals = cast(FakeApprovals, interceptor.approvals)
+    challenges = cast(FakeChallenges, interceptor.challenges)
+    message = request(
+        "tools/call",
+        {
+            "name": "echo",
+            "arguments": {"text": "hi"},
+            "_meta": {
+                **fresh_meta(),
+                APPROVAL_META_KEY: "approval-1",
+                "portunusmcp/challenge_id": "challenge-1",
+                "portunusmcp/challenge_proof": "123456",
+            },
+        },
+    )
+
+    outcome = await interceptor.on_client_message(message)
+
+    assert isinstance(outcome, Forward)
+    assert writer.events == [EventType.HUMAN_APPROVAL_REQUIRED]
+    assert "would require human approval" in writer.rows[0]["payload"]["reason"]
+    assert approvals.redeemed == approvals.created == []
+    assert challenges.redeemed == challenges.created == []
+    assert "_meta" not in message.message.root.params
+
+
+async def test_observe_audit_failure_still_blocks_forwarding() -> None:
+    interceptor, writer, _, _ = make_interceptor(mode=DecisionMode.OBSERVE)
+
+    async def broken_write(*args: Any, **kwargs: Any) -> int:
+        raise ConnectionError("postgres down")
+
+    writer.write = broken_write  # type: ignore[method-assign]
+    outcome = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}})
+    )
+
+    assert isinstance(outcome, Respond)
+    assert outcome.message.message.root.error.code == -32004
 
 
 async def test_replayed_nonce_is_denied_with_canonical_decision() -> None:
@@ -464,6 +603,27 @@ async def test_replayed_nonce_is_denied_with_canonical_decision() -> None:
     assert error.error.data["matched_rules"] == ["replay_guard"]
     assert error.error.data["audit_id"] == "42"
     assert writer.events == [EventType.ALLOW, EventType.DENY_REPLAY]
+
+
+async def test_observe_replay_is_detected_but_forwarded_without_denied_metric() -> None:
+    interceptor, writer, _, _ = make_interceptor(mode=DecisionMode.OBSERVE)
+    before = REGISTRY.get_sample_value("portunusmcp_replay_denied_total") or 0
+    meta = fresh_meta()
+    first = await interceptor.on_client_message(
+        request("tools/call", {"name": "echo", "arguments": {"text": "hi"}, "_meta": dict(meta)})
+    )
+    second = await interceptor.on_client_message(
+        request(
+            "tools/call",
+            {"name": "echo", "arguments": {"text": "again"}, "_meta": dict(meta)},
+            id=2,
+        )
+    )
+
+    assert isinstance(first, Forward)
+    assert isinstance(second, Forward)
+    assert writer.events == [EventType.ALLOW, EventType.DENY_REPLAY]
+    assert (REGISTRY.get_sample_value("portunusmcp_replay_denied_total") or 0) == before
 
 
 async def test_malformed_nonce_is_denied_before_rbac() -> None:

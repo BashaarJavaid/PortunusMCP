@@ -533,7 +533,7 @@ async def _prove_async(
         raise QuickstartError("audited allowed call was not canonical ALLOW")
     if deny_model.event_type is not EventType.DENY_RBAC or deny_model.decision.value != "deny":
         raise QuickstartError("audited denied call was not canonical DENY_RBAC")
-    return allow, deny, row_count
+    return allow_model.model_dump(mode="json"), deny_model.model_dump(mode="json"), row_count
 
 
 def _cleanup(generated: Generated, deadline: Deadline, json_mode: bool) -> None:

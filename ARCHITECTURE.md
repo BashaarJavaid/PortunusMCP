@@ -55,13 +55,13 @@ sequenceDiagram
     end
 ```
 
-`tools/list` deliberately does **not** run the full pipeline — it forwards upstream, caches the schemas, runs the drift check (classification + logging; blocking is enforced per-call at pipeline stage 5), and prunes the response to the identity's RBAC allow-set. Full enforcement happens on every `tools/call`:
+`tools/list` deliberately does **not** run the full pipeline — it forwards upstream, caches the schemas, and runs the drift check. In `enforce` it prunes the response to the identity's RBAC allow-set; in `observe` it returns the full list and audits `would_prune_tools`. Full evaluation happens on every `tools/call`:
 
 > **Design principle, stated explicitly:** `tools/list` pruning is a *planning-surface* control — it shapes what an LLM even considers as an option — and is not itself a security boundary. Nothing prevents a client from calling a tool name it already knows about (from a prior session, from documentation, from having guessed) without ever re-issuing `tools/list`. Therefore **every `tools/call` independently re-runs the full decision pipeline** (below) regardless of whether that tool appeared in the most recent pruned list served to that client. Relying on "the client didn't see it in the menu" as the actual enforcement mechanism is a well-known pitfall — the real boundary is authorization checked fresh at the point of action, every time.
 
 ### 4.2 Decision Pipeline (precedence, explicit)
 
-RBAC, ABAC, drift status, and risk scoring are described as separate mechanisms, but a request is only ever resolved by one deterministic, ordered pipeline — never by asking "did any of these say no" without a defined order, since that leaves the outcome of a disagreement (e.g. RBAC allow + ABAC allow + Risk deny) undefined. The pipeline runs top to bottom; the first stage that produces a terminal outcome ends evaluation there — nothing further downstream is consulted:
+RBAC, ABAC, drift status, and risk scoring are described as separate mechanisms, but a request is only ever resolved by one deterministic, ordered pipeline — never by asking "did any of these say no" without a defined order. In `enforce`, the first terminal stops evaluation. In `observe`, the gateway retains that first terminal, continues through every later applicable stage, attaches the downstream risk score and complete factor list, audits the one canonical would-be Decision, and forwards only after that write succeeds:
 
 ```
 1. Replay Guard        → fail        → DENY (terminal, cheapest check, runs first)
@@ -77,7 +77,7 @@ RBAC, ABAC, drift status, and risk scoring are described as separate mechanisms,
 8. → ALLOW → forward to upstream server
 ```
 
-Every stage is a pure function taking the same request context and returning either `CONTINUE` or a terminal `Decision` (see 4.3 below); this makes each stage independently unit-testable and makes "why did this get denied" always answerable by "which stage stopped it," never ambiguous. Cheapest/cheapest-to-verify checks run first (replay and auth are simple Redis/hash lookups) so an obviously-invalid request never reaches the more expensive policy and risk evaluation.
+Authentication runs at the HTTP edge and remains binding in both modes. Source/tool rate limits, session/resource ceilings, deadlines, upstream availability, and audit-before-action likewise remain enforcing. Observe changes only pipeline Decisions: replay nonces are still consumed, drift and validation failures are still classified, risk frequency/denial counters still advance, and approval/challenge metadata is ignored rather than consumed.
 
 ### 4.3 Canonical Decision Object
 
@@ -87,6 +87,7 @@ Every terminal outcome from the pipeline above — whether returned as a JSON-RP
 {
   "decision": "deny",
   "event_type": "DENY_REPLAY",
+  "mode": "enforce",
   "reason": "Replay detected: nonce already seen within the timestamp window",
   "matched_rules": ["replay_guard"],
   "risk_score": null,
@@ -99,6 +100,7 @@ Every terminal outcome from the pipeline above — whether returned as a JSON-RP
 {
   "decision": "human_approval_required",
   "event_type": "HUMAN_APPROVAL_REQUIRED",
+  "mode": "enforce",
   "reason": "delete_repo on protected repository outside business hours",
   "matched_rules": ["policy-v12:rule-4"],
   "risk_score": 81,
@@ -112,7 +114,7 @@ Every terminal outcome from the pipeline above — whether returned as a JSON-RP
 }
 ```
 
-`event_type` is drawn from one canonical enum (superseding the scattered event names used loosely elsewhere in earlier drafts of this spec): `SESSION_START`, `TOOLS_LIST`, `ALLOW`, `DENY_RBAC`, `DENY_ABAC`, `DENY_REPLAY`, `DENY_DRIFT`, `DENY_RISK`, `DENY_VALIDATION`, `DENY_APPROVAL_MISMATCH`, `DENY_STEP_UP`, `CHALLENGE`, `HUMAN_APPROVAL_REQUIRED`, `APPROVED`, `EXPIRED`, `DRIFT_LOW`, `DRIFT_MEDIUM`, `DRIFT_HIGH`, `DRIFT_CRITICAL`, `POLICY_ACTIVATED`, `POLICY_ERROR`. Splitting `DENY` by cause (`DENY_RBAC` vs `DENY_REPLAY` vs `DENY_RISK`, etc.) rather than logging a generic `DENY` everywhere is what makes the audit log directly queryable for analytics ("show me all risk-based denials this month") instead of needing to parse the `reason` string to find out why.
+`mode` is always `enforce` or `observe`; legacy rows without it reconstruct as `enforce`. Admin mutations and Policy Simulation Decisions are always enforcing. `event_type` is drawn from one canonical enum (superseding the scattered event names used loosely elsewhere in earlier drafts of this spec): `SESSION_START`, `TOOLS_LIST`, `ALLOW`, `DENY_RBAC`, `DENY_ABAC`, `DENY_REPLAY`, `DENY_DRIFT`, `DENY_RISK`, `DENY_VALIDATION`, `DENY_APPROVAL_MISMATCH`, `DENY_STEP_UP`, `CHALLENGE`, `HUMAN_APPROVAL_REQUIRED`, `APPROVED`, `EXPIRED`, `DRIFT_LOW`, `DRIFT_MEDIUM`, `DRIFT_HIGH`, `DRIFT_CRITICAL`, `POLICY_ACTIVATED`, `POLICY_ERROR`.
 
 ### 4.4 Component diagram
 
@@ -203,13 +205,18 @@ graph TD
 
 Every production service has a read-only root, dropped capabilities, no-new-privileges, memory/CPU/PID limits, bounded Docker JSON logs, and only its required writable volumes/tmpfs. The gateway receives one writable policy root (active file, staging journal, revision snapshots), one writable audit-key root (active private key, rotation journal, append-only public keyring), and the Docker socket; the verifier receives only the public-key subdirectory read-only. Production gateway-only policy secrets live in a separate env file rather than exposing Compose/Grafana credentials to the gateway.
 
+`ENFORCEMENT_MODE=enforce|observe` is process-wide and read only at startup. Bare-host
+and demo runs default to `enforce`; production Compose requires an explicit value.
+Changing policy or sending SIGHUP cannot switch it—a gateway recreation/restart is
+required.
+
 The gateway's Docker socket is intentionally **root-equivalent access to the host**. It creates the boundary between upstreams and gateway secrets, but means a shell compromise of the gateway is a host compromise. `DOCKER_GID` grants socket access explicitly; this is an operator trust decision, not a sandbox.
 
 The single-replica constraint is correctness, not sizing advice: Session Manager/container handles are in memory, and item 23 experimentally proved two audit-writer instances can fork the chain. Remote Streamable-HTTP upstreams, a distributed atomic audit writer, and true multi-replica operation remain explicitly deferred. Terraform/ECS is likewise deferred; `compose.prod.yml` is its compose-level prerequisite, not a substitute claim that cloud infrastructure exists.
 
 ### 4.6 Data flow diagram (single request, all stages)
 
-One `tools/call`, in exact §4.2 order. Note the ABAC split (item 17): conditions with no `risk.*` reference run at stage 4; `risk.*` conditions run immediately after scoring but *before* the 40/70/90 threshold mapping, so a failing `risk.score < 60` is `DENY_ABAC` even when the raw score would otherwise map to CHALLENGE or approval. Every terminal outcome — deny, challenge, approval-hold, or allow — ends in a signed, hash-chained audit write. The admin-only paths (`/admin/decisions/*`, `/admin/policy/simulate`) are deliberately absent: they dry-run this pipeline out-of-band (§4.8) and never sit in the live request path.
+One `tools/call`, in exact §4.2 order. In enforce mode each edge to `T` stops; in observe mode it remembers the first edge to `T`, completes the remaining stages, writes that Decision once, and joins the forward path. Every terminal outcome — deny, challenge, approval-hold, or allow — ends in a signed, hash-chained audit write before any forward.
 
 ```mermaid
 graph TD
@@ -231,10 +238,12 @@ graph TD
     P6c -->|"70-90 approval, 40-69 challenge"| T
     P6c -->|"0-39"| P7["7 Param Validation (cached schema, strict)"]
     P7 -->|invalid| T
-    P7 --> P8["8 ALLOW: forward to upstream"]
-    P8 --> RES["result to client"]
+    P7 --> P8["8 ALLOW"]
     T --> AUD["audit write (signed, hash-chained)"]
     P8 --> AUD
+    AUD -->|"ALLOW or observe terminal"| UP["forward to upstream"]
+    AUD -->|"enforce terminal"| ERR["Decision error to client"]
+    UP --> RES["result to client"]
 ```
 
 ### 4.7 Multi-Server Trust Domains (discussion, not implemented)
@@ -390,7 +399,7 @@ GET /admin/decisions/{audit_seq}
 POST /admin/decisions/explain
 { "identity": "agent-readonly-01", "tool": "delete_repo", "arguments": {...}, "context": {...} }
 ```
-runs the same evaluation path *without* actually forwarding the call — useful for testing "what would happen if" before a real request is made, and it's the natural companion to Policy Simulation Mode (that one replays history against a candidate policy; this one evaluates a hypothetical single call against the *current* policy). This is arguably the strongest single feature in the whole project alongside Policy Simulation — "why was I denied" is a question every real user of a system like this eventually asks, where policy simulation is admin-only.
+runs the same evaluation path *without* actually forwarding the call. It uses the running gateway mode: observe retains the first blocker and adds downstream dry-run risk data without side effects. Policy Simulation remains an enforce-mode comparison independent of the running mode.
 
 **Replay Guard** — the nonce (client-generated UUID) + `timestamp` pair travels in `params._meta`, and whether it is *required* is a property of the identity's `auth_mode` (item 34). For `signed` identities the pair is mandatory on every message and is covered by the request HMAC (see Auth Layer below), which is what makes the dedup meaningful: a byte-identical replay dies here, and a fresh nonce dies at the edge because it cannot be re-signed. For `bearer` identities the pair is opportunistic — a volunteered pair is fully enforced (present-but-malformed is a deny, never a silent skip), but a stock MCP client that sends no `_meta` at all skips the check, which is what lets unmodified clients work; a client-supplied nonce with the API key in the same captured request was never real replay protection anyway. When the check runs: a timestamp outside a configurable window (default ±30s) is rejected, and the nonce is checked against a Redis set with a TTL matching that window; a repeat is `DENY_REPLAY`. Dedup is deliberately `tools/call`-only — replaying a captured `tools/list` re-reads a list, no action.
 
@@ -405,7 +414,7 @@ Policy loading also rejects duplicate identity ids, bearer API-key hashes, and s
 
 **Session idle timeout** — clean disconnect and gateway shutdown cover intentional paths; a Redis TTL (`session:{id}:last_seen`, default 5 minutes, refreshed on each request) covers silent clients. While any call is outstanding, a per-session heartbeat refreshes the key every half-TTL; Redis refresh failure tears the session down fail-closed. The heartbeat stops after the final call completes, so a later genuinely idle session expires and is reaped normally.
 
-**Audit Log** — every decision point (session start, tools/list served, DENY, ALLOW, CHALLENGE, APPROVAL_PENDING, drift detected at any severity, admin approval, policy activation) is written as an append-only row with a hash chain:
+**Audit Log** — every decision point (session start, tools/list served, DENY, ALLOW, CHALLENGE, APPROVAL_PENDING, drift detected at any severity, admin approval, policy activation) is written as an append-only row with a hash chain. Live `tools/call` and `TOOLS_LIST` payloads include `mode`; no dedicated column or index is needed:
 
 ```
 H_t = SHA256(H_(t-1) || canonical_json(payload_t))
@@ -498,8 +507,9 @@ A security gateway that silently fails open under load or during an outage is wo
 
 | Subsystem unavailable | Behavior | Rationale |
 |---|---|---|
-| Redis (replay guard, rate limiting, cache) | **Fail closed** — tool-call or source-auth rate-check failure returns HTTP 503 before the decision pipeline; replay/cache failure denies | If the gateway cannot enforce either rate window or check whether a nonce was already seen, silently proceeding would remove a security control during the outage. |
-| Postgres (audit log write) | **Fail closed** — deny the call before it reaches the upstream server | An action that can't be recorded is, for this project's purposes, an action that shouldn't happen — "no record, no action" is the defensible posture even though it costs availability. This is a deliberate trade-off, stated as such. |
+| Redis (rate limits, session state, or `tools/list` processing) | **Fail closed in both modes** — reject before an action/list is served | Observe does not weaken platform/resource gates or tool-list integrity. |
+| Replay/drift/risk/schema dependency inside `tools/call` | **Enforce:** terminal deny. **Observe:** synthesize the same would-be Decision, audit it, then forward | Observe weakens only the pipeline outcome, never the requirement to produce a canonical record first. |
+| Postgres (audit log write) | **Fail closed in both modes** — deny the call before it reaches the upstream server | An action that can't be recorded is, for this project's purposes, an action that shouldn't happen — "no record, no action" is unchanged by observe mode. |
 | Audit key rotation/promotion incomplete | **Fail closed** after the audited handoff — signing readiness fails and audited actions stop until startup recovery; a pre-handoff stage is discarded | Once the chain commits the new fingerprint, continuing on an ambiguous key would make later verification non-deterministic. |
 | Policy promotion incomplete | **Fail closed** after the audited handoff — policy readiness fails and MCP returns 503 until startup recovery; pre-handoff staging is discarded | The audit row and durable active file must converge on the same policy before traffic resumes. |
 | Postgres (policy store, read-only lookup) | **Fail closed**, but backed by an in-memory last-known-good policy snapshot with a short grace period (default 60s) to absorb brief connection blips without denying everything during a transient reconnect | Distinguishes "database had a one-second hiccup" from "database is actually down," without pretending a stale policy is fine indefinitely. |
@@ -539,11 +549,11 @@ The consistent theme: every subsystem whose failure would silently weaken a secu
 
 *Implemented (item 25). Structured logs shipped from day one (item 13); Prometheus/Grafana were added once core gateway logic was stable so effort wasn't split across two problems at once.*
 
-- **Prometheus metrics** (`services/gateway/metrics.py` — exactly this set, no more): `portunusmcp_tool_calls_total{identity, server, tool, decision}` (incremented at the interceptor's three terminal emission points; `decision` = the audit event type; `tool` preserves a name only when it exists in that server's current Redis schema cache, otherwise `other`, including on cache failure), `portunusmcp_schema_drift_total{server, tool, severity}` (Drift Detector classification writes), `portunusmcp_risk_score` (histogram, observed once per freshly scored call whatever the eventual outcome), `portunusmcp_request_latency_seconds` (histogram, decision-pipeline time per `tools/call` — proxy overhead only, the upstream round trip is excluded), `portunusmcp_audit_chain_verify_failures_total` (verifier failure branch), `portunusmcp_replay_denied_total`, and the unlabeled `portunusmcp_auth_throttled_total` (every source-throttled credential attempt). The bundled `PortunusMCPAuthSourceBlocked` warning fires on any five-minute increase in the last counter; notification routing remains operator-managed.
+- **Prometheus metrics** (`services/gateway/metrics.py` — exactly this set, no more): `portunusmcp_tool_calls_total{identity, server, tool, decision, mode}` (`decision` is the audit event type; an observe-mode `DENY_*` is a would-be denial), `portunusmcp_schema_drift_total{server, tool, severity}`, `portunusmcp_risk_score`, `portunusmcp_request_latency_seconds`, `portunusmcp_audit_chain_verify_failures_total`, `portunusmcp_replay_denied_total` (actual enforce-mode replay blocks only), and `portunusmcp_auth_throttled_total`.
 - **Exposure posture:** unauthenticated but internal-only. Metric labels carry identity ids and tool names, so `/metrics` is never served on the published app port — the gateway starts a separate listener on `METRICS_PORT` (default 9100; the verifier sidecar uses 9101, skipped under `--once`), and neither Compose file publishes those ports. Prometheus scrapes them over the Compose network. Metric increments are in-memory and cannot meaningfully fail — no fail-open/fail-closed posture applies.
 - **Prometheus + Grafana containers:** both explicit Compose files have an opt-in `monitoring` profile. Demo publishes anonymous local Grafana; production binds both UIs to loopback, requires a Grafana login, persists their state, and applies the production hardening/limits.
-- **Grafana dashboard** (`monitoring/grafana/dashboards/portunusmcp.json`, provisioned automatically): panels for allow/deny/challenge rate over time, top denied tools, drift events timeline by severity, risk score distribution, p50/p95/p99 pipeline latency.
-- **Structured logs (structlog, JSON):** one line per decision, correlation ID = session ID, shippable to any log aggregator. The first auth-throttle crossing additionally logs raw source IP, `mcp|admin` surface, and retry interval, never credential material.
+- **Grafana dashboard** (`monitoring/grafana/dashboards/portunusmcp.json`, provisioned automatically): decision and denial panels group by mode so observe events are visibly would-be outcomes.
+- **Structured logs (structlog, JSON):** startup logs the process mode (warning for observe), and every live decision line carries `mode` plus the session correlation ID.
 
 ---
 

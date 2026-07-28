@@ -89,6 +89,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
       REDIS_URL: redis://default:${REDIS_PASSWORD}@redis:6379/0
+      ENFORCEMENT_MODE: ${ENFORCEMENT_MODE:?set ENFORCEMENT_MODE to enforce or observe}
       POLICY_FILE: /app/config/policy.yaml
       POLICY_REVISIONS_DIR: /app/config/revisions
       SIGNING_KEY_FILE: /app/secrets/audit_signing_key.pem

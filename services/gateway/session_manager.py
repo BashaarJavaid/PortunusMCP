@@ -27,7 +27,7 @@ from services.gateway import upstream_client
 from services.gateway.approvals import ApprovalStore
 from services.gateway.audit_log import AuditWriter
 from services.gateway.config import settings
-from services.gateway.decision import EventType
+from services.gateway.decision import DecisionMode, EventType
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.jsonrpc_interceptor import (
     TOOL_CALL_DEADLINE_CODE,
@@ -172,6 +172,7 @@ class SessionManager:
                     approvals=self._approval_store,
                     challenges=self._challenge_store,
                     send_upstream=send_upstream,
+                    mode=DecisionMode(settings.enforcement_mode),
                 ),
             )
             self._sessions[session_id] = session

@@ -27,7 +27,7 @@ import structlog
 
 from services.gateway import abac, param_validator
 from services.gateway.db import AuditLog
-from services.gateway.decision import Decision, DecisionOutcome, EventType, RiskFactor
+from services.gateway.decision import Decision, DecisionMode, DecisionOutcome, EventType, RiskFactor
 from services.gateway.drift_detector import DriftDetector
 from services.gateway.policy_engine import PolicyEngine
 from services.gateway.risk_engine import RiskEngine, threshold_outcome
@@ -98,10 +98,13 @@ def from_audit_row(row: AuditLog) -> Decision:
             matched_rules = _FALLBACK_RULES[event_type]
     reason = payload.get("reason") or f"{event_type.value} recorded for {row.tool_name!r}"
     raw_factors = payload.get("risk_factors")
-    risk_factors = [RiskFactor.model_validate(f) for f in raw_factors] if raw_factors else None
+    risk_factors = (
+        [RiskFactor.model_validate(f) for f in raw_factors] if raw_factors is not None else None
+    )
     return Decision(
         decision=outcome,
         event_type=event_type,
+        mode=DecisionMode(payload.get("mode", DecisionMode.ENFORCE)),
         reason=reason,
         matched_rules=list(matched_rules),
         risk_score=row.risk_score,
@@ -137,6 +140,7 @@ async def explain_call(
     risk: RiskEngine,
     schema_cache: SchemaCache,
     validate_params: bool = True,
+    mode: DecisionMode = DecisionMode.ENFORCE,
 ) -> Decision:
     """Dry-run the §4.2 pipeline (minus replay, minus all side effects) for a
     hypothetical call against the current policy. Always returns a Decision with
@@ -157,6 +161,7 @@ async def explain_call(
         return Decision(
             decision=outcome,
             event_type=event_type,
+            mode=mode,
             reason=reason,
             matched_rules=matched_rules,
             risk_score=risk_score,
@@ -164,6 +169,13 @@ async def explain_call(
             policy_version=engine.version,
             alternative=_alternative(outcome, risk_score),
         )
+
+    terminal: Decision | None = None
+
+    def retain(candidate: Decision) -> Decision | None:
+        nonlocal terminal
+        terminal = terminal or candidate
+        return terminal if mode is DecisionMode.ENFORCE else None
 
     def deny_abac(
         condition: abac.Condition,
@@ -206,16 +218,20 @@ async def explain_call(
 
     # Stage 3: RBAC (stages 1-2, replay + auth, don't apply to a hypothetical call).
     grant = engine.matching_grant(identity_id, server_id, tool_name)
+    conditions = grant.compiled_conditions if grant is not None else []
     if grant is None:
-        return decide(
-            DecisionOutcome.DENY,
-            EventType.DENY_RBAC,
-            f"identity {identity_id!r} is not authorized to call {tool_name!r}",
-            [f"policy-v{engine.version}:rbac"],
+        stopped = retain(
+            decide(
+                DecisionOutcome.DENY,
+                EventType.DENY_RBAC,
+                f"identity {identity_id!r} is not authorized to call {tool_name!r}",
+                [f"policy-v{engine.version}:rbac"],
+            )
         )
+        if stopped is not None:
+            return stopped
 
     # Stage 4: ABAC, non-risk conditions (risk.* defers until a score exists).
-    conditions = grant.compiled_conditions
     attrs: dict[str, abac.AttrValue] = {
         "identity.id": identity_id,
         "tool.name": tool_name,
@@ -228,7 +244,9 @@ async def explain_call(
             attrs[f"identity.{key}"] = value
     failed = check_conditions([c for c in conditions if not c.references_risk], attrs)
     if failed is not None:
-        return deny_abac(*failed)
+        stopped = retain(deny_abac(*failed))
+        if stopped is not None:
+            return stopped
 
     # Stage 5: drift status; a lookup failure denies like the live path (§5).
     try:
@@ -237,13 +255,17 @@ async def explain_call(
         logger.exception("drift_status_lookup_failed_fail_closed", tool=tool_name)
         drift_blocked = True
     if drift_blocked:
-        return decide(
-            DecisionOutcome.DENY,
-            EventType.DENY_DRIFT,
-            f"{tool_name!r} is blocked: schema drifted from its approved baseline"
-            " and is pending re-approval",
-            ["drift_detector"],
+        stopped = retain(
+            decide(
+                DecisionOutcome.DENY,
+                EventType.DENY_DRIFT,
+                f"{tool_name!r} is blocked: schema drifted from its approved baseline"
+                " and is pending re-approval",
+                ["drift_detector"],
+            )
         )
+        if stopped is not None:
+            return stopped
 
     # Stage 6: risk scoring, side-effect-free; a crashed calculation is maximum
     # risk (§5). No approval-redemption branch — explain has no approval id.
@@ -263,40 +285,66 @@ async def explain_call(
                 )
             ],
         )
+    if terminal is not None:
+        terminal.risk_score = risk_score
+        terminal.risk_factors = risk_factors
     attrs["risk.score"] = risk_score
     failed = check_conditions([c for c in conditions if c.references_risk], attrs)
     if failed is not None:
         condition, problem = failed
-        return deny_abac(condition, problem, risk_score=risk_score, risk_factors=risk_factors)
+        stopped = retain(
+            deny_abac(
+                condition,
+                problem,
+                risk_score=risk_score,
+                risk_factors=risk_factors,
+            )
+        )
+        if stopped is not None:
+            return stopped
     threshold = threshold_outcome(risk_score)
     if threshold is DecisionOutcome.DENY:
-        return decide(
-            DecisionOutcome.DENY,
-            EventType.DENY_RISK,
-            f"risk score {risk_score} for {tool_name!r} exceeds the deny threshold (90)",
-            ["risk_engine"],
-            risk_score=risk_score,
-            risk_factors=risk_factors,
+        stopped = retain(
+            decide(
+                DecisionOutcome.DENY,
+                EventType.DENY_RISK,
+                f"risk score {risk_score} for {tool_name!r} exceeds the deny threshold (90)",
+                ["risk_engine"],
+                risk_score=risk_score,
+                risk_factors=risk_factors,
+            )
         )
+        if stopped is not None:
+            return stopped
     if threshold is DecisionOutcome.HUMAN_APPROVAL_REQUIRED:
         # No approvals row on a dry run — the Decision says what would happen.
-        return decide(
-            DecisionOutcome.HUMAN_APPROVAL_REQUIRED,
-            EventType.HUMAN_APPROVAL_REQUIRED,
-            f"risk score {risk_score} for {tool_name!r} requires human approval",
-            ["risk_engine"],
-            risk_score=risk_score,
-            risk_factors=risk_factors,
+        qualifier = "would require" if mode is DecisionMode.OBSERVE else "requires"
+        stopped = retain(
+            decide(
+                DecisionOutcome.HUMAN_APPROVAL_REQUIRED,
+                EventType.HUMAN_APPROVAL_REQUIRED,
+                f"risk score {risk_score} for {tool_name!r} {qualifier} human approval",
+                ["risk_engine"],
+                risk_score=risk_score,
+                risk_factors=risk_factors,
+            )
         )
+        if stopped is not None:
+            return stopped
     if threshold is DecisionOutcome.CHALLENGE:
-        return decide(
-            DecisionOutcome.CHALLENGE,
-            EventType.CHALLENGE,
-            f"risk score {risk_score} for {tool_name!r} requires confirmation",
-            ["risk_engine"],
-            risk_score=risk_score,
-            risk_factors=risk_factors,
+        qualifier = "would require" if mode is DecisionMode.OBSERVE else "requires"
+        stopped = retain(
+            decide(
+                DecisionOutcome.CHALLENGE,
+                EventType.CHALLENGE,
+                f"risk score {risk_score} for {tool_name!r} {qualifier} confirmation",
+                ["risk_engine"],
+                risk_score=risk_score,
+                risk_factors=risk_factors,
+            )
         )
+        if stopped is not None:
+            return stopped
 
     # Stage 7: param validation from the shared cache only — a dry run never
     # re-fetches from the upstream, so a cold cache fails closed with an explicit
@@ -312,7 +360,7 @@ async def explain_call(
         )
 
     if not validate_params:
-        return decide(
+        return terminal or decide(
             DecisionOutcome.ALLOW,
             EventType.ALLOW,
             f"call to {tool_name!r} would be allowed",
@@ -327,21 +375,31 @@ async def explain_call(
         logger.exception("schema_cache_read_failed_fail_closed", tool=tool_name)
         tools = None
     if tools is None:
-        return deny_validation(
-            "tool schema not cached; explain fails closed"
-            " (a live call would re-fetch it from the upstream)"
+        stopped = retain(
+            deny_validation(
+                "tool schema not cached; explain fails closed"
+                " (a live call would re-fetch it from the upstream)"
+            )
         )
-    input_schema = next(
-        (t.get("inputSchema", {}) for t in tools if t.get("name") == tool_name), None
+        if stopped is not None:
+            return stopped
+    input_schema = (
+        next((t.get("inputSchema", {}) for t in tools if t.get("name") == tool_name), None)
+        if tools is not None
+        else None
     )
     if input_schema is None:
-        return deny_validation("tool schema unavailable from upstream")
-    error = param_validator.validate(arguments, input_schema)
+        stopped = retain(deny_validation("tool schema unavailable from upstream"))
+        if stopped is not None:
+            return stopped
+    error = param_validator.validate(arguments, input_schema) if input_schema is not None else None
     if error is not None:
-        return deny_validation(error)
+        stopped = retain(deny_validation(error))
+        if stopped is not None:
+            return stopped
 
     # Stage 8: ALLOW — no forward/audit on a dry run.
-    return decide(
+    return terminal or decide(
         DecisionOutcome.ALLOW,
         EventType.ALLOW,
         f"call to {tool_name!r} would be allowed",

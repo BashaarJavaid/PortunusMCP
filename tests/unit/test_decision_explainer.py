@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from services.gateway.db import AuditLog
-from services.gateway.decision import DecisionOutcome, EventType, RiskFactor
+from services.gateway.decision import DecisionMode, DecisionOutcome, EventType, RiskFactor
 from services.gateway.decision_explainer import (
     _alternative,
     _context_hour,
@@ -106,6 +106,7 @@ def test_deny_step_up_row_is_a_decision() -> None:
 
 def test_legacy_rbac_deny_reconstructs_rules_and_reason() -> None:
     decision = from_audit_row(row(event_type=EventType.DENY_RBAC.value, payload={}))
+    assert decision.mode is DecisionMode.ENFORCE
     assert decision.matched_rules == ["policy-v7:rbac"]
     assert "DENY_RBAC" in decision.reason
     assert decision.alternative is None  # no score, no alternative
@@ -194,6 +195,7 @@ async def explain(
     detector: FakeDetector | None = None,
     risk: FakeRisk | None = None,
     cache: FakeCache | None = None,
+    mode: DecisionMode = DecisionMode.ENFORCE,
 ) -> Any:
     return await explain_call(
         identity,
@@ -205,6 +207,7 @@ async def explain(
         detector=detector or FakeDetector(),  # type: ignore[arg-type]
         risk=risk or FakeRisk(),  # type: ignore[arg-type]
         schema_cache=cache or FakeCache(ECHO_TOOLS),  # type: ignore[arg-type]
+        mode=mode,
     )
 
 
@@ -259,3 +262,16 @@ async def test_explain_invalid_arguments() -> None:
     decision = await explain(arguments={"unknown_field": 1})
     assert decision.event_type is EventType.DENY_VALIDATION
     assert "unknown argument field" in decision.reason
+
+
+async def test_observe_explain_keeps_first_blocker_and_adds_downstream_risk() -> None:
+    factors = [RiskFactor(factor="example", contribution=50)]
+    decision = await explain(
+        identity="nobody",
+        risk=FakeRisk(score=50, factors=factors),
+        mode=DecisionMode.OBSERVE,
+    )
+    assert decision.mode is DecisionMode.OBSERVE
+    assert decision.event_type is EventType.DENY_RBAC
+    assert decision.risk_score == 50
+    assert decision.risk_factors == factors

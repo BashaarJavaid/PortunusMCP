@@ -50,8 +50,10 @@ def test_installed_quickstart_proves_allow_and_deny(tmp_path: Path) -> None:
         proof = json.loads(result.stdout)
         assert proof["decisions"]["allow"]["event_type"] == "ALLOW"
         assert proof["decisions"]["allow"]["decision"] == "allow"
+        assert proof["decisions"]["allow"]["mode"] == "enforce"
         assert proof["decisions"]["deny"]["event_type"] == "DENY_RBAC"
         assert proof["decisions"]["deny"]["decision"] == "deny"
+        assert proof["decisions"]["deny"]["mode"] == "enforce"
         assert proof["metadata"]["upstream_image_id"].startswith("sha256:")
         credentials = (output / "credentials.env").read_text().splitlines()
         for line in credentials[1:]:

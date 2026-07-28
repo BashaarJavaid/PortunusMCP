@@ -23,7 +23,7 @@ def sample(name: str, labels: dict[str, str] | None = None) -> float:
 
 
 async def test_decision_counters_latency_and_scrape_port(gateway: Gateway) -> None:
-    ident = {"identity": "agent-readonly", "server": "default"}
+    ident = {"identity": "agent-readonly", "server": "default", "mode": "enforce"}
     allow = {**ident, "tool": "echo", "decision": "ALLOW"}
     deny = {**ident, "tool": "add", "decision": "DENY_RBAC"}
     before_allow = sample("portunusmcp_tool_calls_total", allow)
@@ -82,6 +82,7 @@ async def test_unknown_tool_names_share_one_bounded_label(gateway: Gateway) -> N
         "server": "default",
         "tool": "other",
         "decision": "DENY_RBAC",
+        "mode": "enforce",
     }
     before = sample("portunusmcp_tool_calls_total", labels)
     names = [f"attacker-name-{i}" for i in range(10)]

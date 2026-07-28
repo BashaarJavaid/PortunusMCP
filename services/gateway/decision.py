@@ -44,6 +44,11 @@ class DecisionOutcome(StrEnum):
     HUMAN_APPROVAL_REQUIRED = "human_approval_required"
 
 
+class DecisionMode(StrEnum):
+    ENFORCE = "enforce"
+    OBSERVE = "observe"
+
+
 class RiskFactor(BaseModel):
     factor: str
     contribution: int
@@ -54,6 +59,8 @@ class RiskFactor(BaseModel):
 class Decision(BaseModel):
     decision: DecisionOutcome
     event_type: EventType
+    # Missing on pre-item-49 rows and v0.1.0 responses: those were always enforcing.
+    mode: DecisionMode = DecisionMode.ENFORCE
     reason: str
     matched_rules: list[str]
     risk_score: int | None = None
