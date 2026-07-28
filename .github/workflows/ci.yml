@@ -68,7 +68,8 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: docker build -t portunusmcp:dev .
       # Service containers are up, so the integration/adversarial suites run
-      # for real here — the reachability skip in clean_audit must not fire.
+      # for real here — the reachability skip in clean_audit must not fire, and
+      # item 48's installed quickstart must prove ALLOW + DENY_RBAC end to end.
       - run: pytest --cov=services --cov-fail-under=80
 
   benchmark:

@@ -60,6 +60,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["services"]
+artifacts = ["services/quickstart.compose.yml"]
 
 [tool.ruff]
 target-version = "py312"

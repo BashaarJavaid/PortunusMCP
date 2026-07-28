@@ -6,6 +6,12 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Added `portunusmcp quickstart`, a non-interactive, installed-CLI path from a local
+  stdio MCP image to independently verified canonical `ALLOW` and `DENY_RBAC`
+  Decisions on a generated loopback-only hardened stack.
+
 ## [0.1.0] - 2026-07-27
 
 ### Added

@@ -1,0 +1,232 @@
+name: ${QUICKSTART_NAMESPACE}
+
+x-security: &security
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "5"
+
+services:
+  postgres:
+    <<: *security
+    image: ${POSTGRES_IMAGE}
+    user: "999:999"
+    environment:
+      POSTGRES_USER: portunusmcp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: portunusmcp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    tmpfs:
+      - /var/run/postgresql:uid=999,gid=999,mode=3775
+      - /tmp:uid=999,gid=999,mode=1777
+    networks: [data]
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    logging: *logging
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U portunusmcp -d portunusmcp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    <<: *security
+    image: ${REDIS_IMAGE}
+    user: "999:999"
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    command:
+      - sh
+      - -ec
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$$REDISCLI_AUTH"
+    volumes:
+      - redisdata:/data
+    networks: [data]
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    logging: *logging
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    <<: *security
+    image: ${GATEWAY_IMAGE}
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
+    networks: [data]
+    restart: "no"
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 64
+    logging: *logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  keys-init:
+    <<: *security
+    image: ${GATEWAY_IMAGE}
+    user: "0:0"
+    cap_add: [SETUID, SETGID]
+    entrypoint: [sh, -ec]
+    command:
+      - |
+        chmod 0777 /runtime
+        setpriv --reuid="$$HOST_UID" --regid="$$HOST_GID" --clear-groups sh -ec '
+          mkdir -p /runtime/owned/public
+          chmod 0700 /runtime/owned /runtime/owned/public
+          if [ ! -e /runtime/owned/audit_signing_key.pem ]; then
+            cp /seed/audit_signing_key.pem /runtime/owned/audit_signing_key.pem
+          fi
+          for source in /seed/public/*.pub.pem; do
+            [ -f "$$source" ] || continue
+            destination="/runtime/owned/public/$${source##*/}"
+            [ -e "$$destination" ] || cp "$$source" "$$destination"
+          done
+          chmod 0600 /runtime/owned/audit_signing_key.pem
+          chmod 0444 /runtime/owned/public/*.pub.pem
+        '
+        chmod 0711 /runtime
+    environment:
+      HOST_UID: ${HOST_UID}
+      HOST_GID: ${HOST_GID}
+    volumes:
+      - ${SECRETS_DIR}:/seed:ro
+      - auditkeys:/runtime
+    network_mode: none
+    restart: "no"
+    mem_limit: 64m
+    cpus: 0.1
+    pids_limit: 32
+    logging: *logging
+
+  gateway:
+    <<: *security
+    image: ${GATEWAY_IMAGE}
+    user: "${HOST_UID}:${HOST_GID}"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
+      REDIS_URL: redis://default:${REDIS_PASSWORD}@redis:6379/0
+      POLICY_FILE: /app/config/policy.yaml
+      POLICY_REVISIONS_DIR: /app/config/revisions
+      SIGNING_KEY_FILE: /app/key-volume/owned/audit_signing_key.pem
+      SIGNING_PUBLIC_KEYS_DIR: /app/key-volume/owned/public
+      MAX_MCP_BODY_BYTES: ${MAX_MCP_BODY_BYTES}
+      MAX_JSON_DEPTH: ${MAX_JSON_DEPTH}
+      MAX_SESSIONS_PER_IDENTITY: ${MAX_SESSIONS_PER_IDENTITY}
+      MAX_INFLIGHT_CALLS_PER_IDENTITY: ${MAX_INFLIGHT_CALLS_PER_IDENTITY}
+      TOOL_CALL_RATE_LIMIT: ${TOOL_CALL_RATE_LIMIT}
+      TOOL_CALL_RATE_WINDOW_SECONDS: ${TOOL_CALL_RATE_WINDOW_SECONDS}
+      AUTH_FAILURE_RATE_LIMIT: ${AUTH_FAILURE_RATE_LIMIT}
+      AUTH_FAILURE_RATE_WINDOW_SECONDS: ${AUTH_FAILURE_RATE_WINDOW_SECONDS}
+      TOOL_CALL_DEADLINE_SECONDS: ${TOOL_CALL_DEADLINE_SECONDS}
+      READINESS_TIMEOUT_SECONDS: ${READINESS_TIMEOUT_SECONDS}
+      SCHEMA_CACHE_TTL: ${SCHEMA_CACHE_TTL}
+      SESSION_IDLE_TTL: ${SESSION_IDLE_TTL}
+      SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS}
+      REPLAY_WINDOW_SECONDS: ${REPLAY_WINDOW_SECONDS}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS}
+      BUSINESS_HOURS_START_UTC: ${BUSINESS_HOURS_START_UTC}
+      BUSINESS_HOURS_END_UTC: ${BUSINESS_HOURS_END_UTC}
+      RISK_FREQ_WINDOW_SECONDS: ${RISK_FREQ_WINDOW_SECONDS}
+      RISK_FREQ_THRESHOLD: ${RISK_FREQ_THRESHOLD}
+      RISK_DECAY_STEP: ${RISK_DECAY_STEP}
+      RISK_DECAY_MAX: ${RISK_DECAY_MAX}
+      RISK_DECAY_TTL_SECONDS: ${RISK_DECAY_TTL_SECONDS}
+      RISK_DENIAL_WINDOW_SECONDS: ${RISK_DENIAL_WINDOW_SECONDS}
+      RISK_DENIAL_THRESHOLD: ${RISK_DENIAL_THRESHOLD}
+      RISK_DRIFT_HISTORY_WINDOW_SECONDS: ${RISK_DRIFT_HISTORY_WINDOW_SECONDS}
+      RISK_DRIFT_HISTORY_THRESHOLD: ${RISK_DRIFT_HISTORY_THRESHOLD}
+      DRIFT_DESCRIPTION_SEVERITY: ${DRIFT_DESCRIPTION_SEVERITY}
+      APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS}
+      STEP_UP_TTL_SECONDS: ${STEP_UP_TTL_SECONDS}
+      METRICS_HOST: 0.0.0.0
+      UPSTREAM_RUNTIME_NAMESPACE: ${QUICKSTART_NAMESPACE}
+      DOCKER_HOST: unix:///var/run/docker.sock
+    group_add:
+      - ${DOCKER_GID}
+    volumes:
+      - ${CONFIG_DIR}:/app/config
+      - auditkeys:/app/key-volume
+      - /var/run/docker.sock:/var/run/docker.sock
+    tmpfs:
+      - /tmp:uid=${HOST_UID},gid=${HOST_GID},mode=1777
+    ports:
+      - 127.0.0.1:${GATEWAY_PORT}:8000
+    networks: [edge, data]
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    logging: *logging
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      keys-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          CMD,
+          python,
+          -c,
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  verifier:
+    <<: *security
+    image: ${GATEWAY_IMAGE}
+    user: "${HOST_UID}:${HOST_GID}"
+    command: python scripts/audit_verifier_daemon.py
+    environment:
+      DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
+      SIGNING_PUBLIC_KEYS_DIR: /app/key-volume/owned/public
+      VERIFY_INTERVAL_SECONDS: ${VERIFY_INTERVAL_SECONDS}
+      METRICS_PORT: "9101"
+      METRICS_HOST: 0.0.0.0
+    volumes:
+      - auditkeys:/app/key-volume:ro
+    tmpfs:
+      - /tmp:uid=${HOST_UID},gid=${HOST_GID},mode=1777
+    networks: [data]
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 64
+    logging: *logging
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      keys-init:
+        condition: service_completed_successfully
+
+networks:
+  edge:
+  data:
+    internal: true
+
+volumes:
+  pgdata:
+  redisdata:
+  auditkeys:

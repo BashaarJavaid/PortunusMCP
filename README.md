@@ -155,6 +155,67 @@ The full version, including the assumptions the whole model rests on, is in [`TH
 
 ---
 
+## Quickstart
+
+`portunusmcp quickstart` is the evaluation path from an existing local stdio MCP image
+to one verified `ALLOW` and one verified `DENY_RBAC`. It creates and starts the real
+PostgreSQL, Redis, migration, gateway, and audit-verifier stack; it is not a
+SQLite-shaped substitute for the production deployment.
+
+Prerequisites:
+
+- Python 3.12 with `portunusmcp` installed from PyPI.
+- Docker Engine and Docker Compose with `/var/run/docker.sock` available (tested
+  release line: Engine 29.x and Compose 5.x).
+- Linux amd64/arm64 or macOS arm64, running as a non-root user.
+- Internet access for the three immutable release images, plus a pre-existing local
+  image containing the upstream MCP server. Quickstart never pulls the upstream.
+
+For example, against a local image whose `echo` tool accepts `{"text": ...}`:
+
+```bash
+portunusmcp --timeout 300 quickstart \
+  --upstream-image my-local-mcp:latest \
+  --allow-tool echo \
+  --arguments '{"text":"hello"}' \
+  --output-dir ./portunusmcp-quickstart \
+  --command python -m my_mcp_server
+```
+
+`--command` must be last; everything after it is passed as argv without a shell.
+Quickstart resolves the supplied image to its local immutable `sha256:...` image ID,
+generates two 256-bit bearer credentials and a fingerprint-addressed audit key, binds
+the gateway only to `127.0.0.1:8000`, disables upstream networking and environment
+passthrough, then prints the full canonical Decisions after independently verifying
+the audit export. Raw credentials are written only to the mode-`0600`
+`portunusmcp-quickstart/credentials.env` file:
+
+```bash
+cd ./portunusmcp-quickstart
+set -a && source ./credentials.env && set +a
+# PORTUNUSMCP_URL=http://127.0.0.1:8000
+# MCP endpoint: http://127.0.0.1:8000/mcp/default
+```
+
+The private mode-`0700` work directory also contains `compose.quickstart.yml`,
+`.env.quickstart`, `config/policy.yaml`, the revision directory, and
+`secrets/audit_signing_key.pem` plus its public-key ring. A successful run leaves the
+stack running and prints exact start/restart, state-preserving stop, and destructive
+reset commands. Their shapes are:
+
+```bash
+docker compose --env-file .env.quickstart -p <printed-namespace> -f compose.quickstart.yml down
+docker compose --env-file .env.quickstart -p <printed-namespace> -f compose.quickstart.yml down --volumes
+```
+
+The second command deletes PostgreSQL, Redis, and runtime audit-key named volumes; the
+generated host key files remain. The mounted Docker socket grants the gateway
+root-equivalent control of the host; only trusted operators and upstream images should
+use it. Quickstart is an evaluation/on-ramp profile, not a replacement for the
+hardened, operator-configured [`compose.prod.yml`](./compose.prod.yml).
+
+---
+
 ## Run the demo
 
 ```bash

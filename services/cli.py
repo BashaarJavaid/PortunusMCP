@@ -16,6 +16,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from services import quickstart
 from services.gateway.audit_export import verify_file
 
 VERSION = "0.1.0"
@@ -163,6 +164,19 @@ def _parser() -> argparse.ArgumentParser:
     export.add_argument("--to-seq", type=_positive_int)
     export.add_argument("--output", required=True)
     export.add_argument("--force", action="store_true")
+
+    start = groups.add_parser("quickstart")
+    start.add_argument("--upstream-image", required=True)
+    start.add_argument("--allow-tool", required=True)
+    start.add_argument("--arguments", required=True, type=quickstart.json_object)
+    start.add_argument("--port", type=quickstart.port_number, default=8000)
+    start.add_argument("--output-dir", default="./portunusmcp-quickstart")
+    start.add_argument(
+        "--command",
+        nargs=argparse.REMAINDER,
+        required=True,
+        help="upstream argv; must be the final option",
+    )
     return parser
 
 
@@ -305,6 +319,8 @@ def _export(args: argparse.Namespace, client: Client) -> dict[str, Any]:
 
 
 def _human(result: Any, args: argparse.Namespace) -> str:
+    if args.group == "quickstart":
+        return quickstart.human(result)
     if args.group == "keys" and args.action == "generate":
         return "\n".join(f"{key}: {value}" for key, value in result.items())
     if args.group == "baselines" and args.action == "show":
@@ -328,7 +344,9 @@ def main(argv: list[str] | None = None) -> int:
     args: argparse.Namespace | None = None
     try:
         args = parser.parse_args(argv)
-        if args.group == "keys" and args.action == "generate":
+        if args.group == "quickstart":
+            result = quickstart.run(args)
+        elif args.group == "keys" and args.action == "generate":
             result = _generate(args)
         else:
             if not args.url:
@@ -349,8 +367,14 @@ def main(argv: list[str] | None = None) -> int:
             else _human(result, args)
         )
         return 0
-    except (CLIError, OSError, ValueError) as exc:
-        if args is not None and args.json:
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except quickstart.QuickstartUsageError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (CLIError, quickstart.QuickstartError, OSError, ValueError) as exc:
+        if args is not None and args.json and args.group != "quickstart":
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2, sort_keys=True))
         else:
             print(f"error: {exc}", file=sys.stderr)
