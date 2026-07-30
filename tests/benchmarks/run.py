@@ -35,7 +35,7 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -63,6 +63,7 @@ CALLS_PER_SESSION = 20
 WARMUP_CALLS = 20
 WARM_CONTAINER_LAUNCHES = 20
 UPSTREAM_IMAGE = "portunusmcp:dev"
+DISTRIBUTION_STATS = ("mean", "p50", "p95", "p99")
 
 
 def bench_policy(keys: dict[str, str]) -> dict:
@@ -158,7 +159,11 @@ def dist(samples: list[float]) -> dict[str, float]:
 
 
 def fmt_dist(d: dict[str, float]) -> str:
-    return " / ".join(f"{d[k]:.2f}" for k in ("mean", "p50", "p95", "p99")) + " ms"
+    return " / ".join(f"{d[k]:.2f}" for k in DISTRIBUTION_STATS) + " ms"
+
+
+def subtract_dist(gateway: dict[str, float], direct: dict[str, float]) -> dict[str, float]:
+    return {key: gateway[key] - direct[key] for key in DISTRIBUTION_STATS}
 
 
 async def bench_single_call(gw: Gateway, n: int) -> dict[str, dict[str, float]]:
@@ -235,17 +240,18 @@ def aggregate_upstream_memory_mib(namespace: str) -> float:
     return sum(_memory_mib(row.split("/", 1)[0]) for row in rows)
 
 
-async def bench_concurrent(
-    gw: Gateway, namespace: str
-) -> tuple[dict[int, dict[str, float]], float]:
-    """Scenario 3: p95 across all calls at each concurrency level, one gateway process,
-    each session owning its own upstream stdio subprocess."""
+async def _bench_concurrent_level(
+    session_factory: Callable[[], AbstractAsyncContextManager[ClientSession]],
+    level: int,
+    on_ready: Callable[[], float] | None = None,
+) -> tuple[dict[str, float], float]:
+    barrier = asyncio.Barrier(level + 1)
 
-    async def worker(barrier: asyncio.Barrier) -> list[float]:
+    async def worker() -> list[float]:
         try:
-            async with gateway_session(gw, "developer") as session:
+            async with session_factory() as session:
                 await barrier.wait()  # every session initialized before anyone is timed
-                await barrier.wait()  # benchmark process samples live container memory
+                await barrier.wait()  # benchmark process samples memory, when requested
                 call = functools.partial(session.call_tool, "read_file", {"path": "bench.txt"})
                 await timed_calls(call, 2)
                 return await timed_calls(call, CALLS_PER_SESSION)
@@ -253,23 +259,51 @@ async def bench_concurrent(
             await barrier.abort()  # don't strand the other workers at the barrier
             raise
 
-    results: dict[int, dict[str, float]] = {}
+    workers = [asyncio.create_task(worker()) for _ in range(level)]
+    sample = 0.0
+    try:
+        await barrier.wait()
+        if on_ready is not None:
+            sample = on_ready()
+        await barrier.wait()
+        per_session = await asyncio.gather(*workers)
+    except BaseException:
+        await barrier.abort()
+        for worker_task in workers:
+            worker_task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
+    return dist([latency for session in per_session for latency in session]), sample
+
+
+async def bench_concurrent(
+    gw: Gateway, namespace: str
+) -> tuple[
+    dict[int, dict[str, float]],
+    dict[int, dict[str, float]],
+    dict[int, dict[str, float]],
+    float,
+]:
+    """Scenario 3: direct stdio then gateway calls at each concurrency level."""
+
+    gateway_results: dict[int, dict[str, float]] = {}
+    direct_results: dict[int, dict[str, float]] = {}
+    overhead_results: dict[int, dict[str, float]] = {}
     upstream_memory_mib = 0.0
     for level in CONCURRENCY_LEVELS:
-        barrier = asyncio.Barrier(level + 1)
-        # return_exceptions so every worker has fully unwound before we re-raise —
-        # otherwise leaked workers keep hitting the gateway during teardown.
-        workers = [asyncio.create_task(worker(barrier)) for _ in range(level)]
-        await barrier.wait()
-        if level == CONCURRENCY_LEVELS[-1]:
-            upstream_memory_mib = aggregate_upstream_memory_mib(namespace)
-        await barrier.wait()
-        per_session = await asyncio.gather(*workers, return_exceptions=True)
-        failures = [r for r in per_session if isinstance(r, BaseException)]
-        if failures:
-            raise failures[0]
-        results[level] = dist([lat for session_lats in per_session for lat in session_lats])
-    return results, upstream_memory_mib
+        direct_results[level], _ = await _bench_concurrent_level(direct_session, level)
+        memory_sample = (
+            functools.partial(aggregate_upstream_memory_mib, namespace)
+            if level == CONCURRENCY_LEVELS[-1]
+            else None
+        )
+        gateway_results[level], sampled_memory = await _bench_concurrent_level(
+            functools.partial(gateway_session, gw, "developer"), level, memory_sample
+        )
+        overhead_results[level] = subtract_dist(gateway_results[level], direct_results[level])
+        if memory_sample is not None:
+            upstream_memory_mib = sampled_memory
+    return gateway_results, direct_results, overhead_results, upstream_memory_mib
 
 
 async def bench_payload_size(gw: Gateway) -> dict[str, float]:
@@ -297,8 +331,11 @@ def max_rss_mib() -> float:
 
 def render(report: dict) -> str:
     single, conc, payload = report["single_call"], report["concurrent"], report["payload_size"]
+    conc_direct = report["concurrent_direct"]
+    conc_overhead = report["concurrent_overhead"]
     initialization = report["container_initialization"]
-    overhead = {k: single["gateway_cached"][k] - single["direct"][k] for k in single["direct"]}
+    cached_overhead = subtract_dist(single["gateway_cached"], single["direct"])
+    cold_overhead = subtract_dist(single["gateway_cold"], single["direct"])
     lines = [
         "# PortunusMCP benchmark report",
         "",
@@ -306,18 +343,24 @@ def render(report: dict) -> str:
         f"- host: {report['host']}  |  python: {report['python']}",
         f"- N={report['n']} sequential calls/scenario; {CALLS_PER_SESSION} calls/session "
         "at each concurrency level; latencies as mean / p50 / p95 / p99",
-        "- one in-process gateway; cold cache = Redis DEL of the schema key before each "
-        "timed call; gateway upstreams are real Docker containers",
+        "- direct runs before gateway at each concurrency level; two untimed warmups "
+        "per session; direct sessions own local stdio subprocesses and gateway sessions "
+        "own real Docker containers",
+        "- overhead subtracts independently summarized statistics; cold cache = Redis DEL "
+        "before each timed gateway call; the shared direct baseline has no schema cache",
         "",
         "| Scenario | Direct call | Through gateway | Overhead (gateway − direct) |",
         "|---|---|---|---|",
         f"| Single call, cached schema | {fmt_dist(single['direct'])} "
-        f"| {fmt_dist(single['gateway_cached'])} | {fmt_dist(overhead)} |",
+        f"| {fmt_dist(single['gateway_cached'])} | {fmt_dist(cached_overhead)} |",
         f"| Single call, cold schema cache | {fmt_dist(single['direct'])} "
-        f"| {fmt_dist(single['gateway_cold'])} | — |",
+        f"| {fmt_dist(single['gateway_cold'])} | {fmt_dist(cold_overhead)} |",
     ]
     for level in CONCURRENCY_LEVELS:
-        lines.append(f"| {level} concurrent sessions (p95) | — | {conc[level]['p95']:.2f} ms | — |")
+        lines.append(
+            f"| {level} concurrent sessions | {fmt_dist(conc_direct[level])} "
+            f"| {fmt_dist(conc[level])} | {fmt_dist(conc_overhead[level])} |"
+        )
     lines += [
         f"| tools/list payload size | {payload['direct_bytes']:.0f} B (unpruned) "
         f"| {payload['pruned_bytes']:.0f} B (pruned developer) "
@@ -372,7 +415,12 @@ async def main() -> None:
             print(f"gateway up at {gw.url}; running single-call scenarios (N={n}) ...")
             single = await bench_single_call(gw, n)
             print("running concurrent-session scenarios ...")
-            concurrent, upstream_memory_mib = await bench_concurrent(gw, namespace)
+            (
+                concurrent,
+                concurrent_direct,
+                concurrent_overhead,
+                upstream_memory_mib,
+            ) = await bench_concurrent(gw, namespace)
             payload = await bench_payload_size(gw)
 
     report = {
@@ -386,6 +434,8 @@ async def main() -> None:
         "container_initialization": initialization,
         "single_call": single,
         "concurrent": concurrent,
+        "concurrent_direct": concurrent_direct,
+        "concurrent_overhead": concurrent_overhead,
         "payload_size": payload,
         "max_rss_mib": max_rss_mib(),
         "upstream_memory_mib": upstream_memory_mib,
