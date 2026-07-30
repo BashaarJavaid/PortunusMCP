@@ -111,6 +111,7 @@ def _write_env(
         "ALLOWED_HOSTS": '["127.0.0.1:*","localhost:*"]',
         "ALLOWED_ORIGINS": "[]",
         "FORWARDED_ALLOW_IPS": "*",
+        "ENFORCEMENT_MODE": "enforce",
         "MAX_MCP_BODY_BYTES": "1048576",
         "MAX_JSON_DEPTH": "32",
         "MAX_SESSIONS_PER_IDENTITY": "3",
@@ -180,6 +181,42 @@ def _inspect(env_file: Path, project: str, override: Path, service: str) -> dict
     return json.loads(_run("docker", "inspect", container_id))[0]
 
 
+def test_production_compose_requires_and_renders_enforcement_mode(tmp_path: Path) -> None:
+    _require_docker()
+    env_file, _, _ = _write_env(tmp_path, tmp_path, tmp_path)
+    project = f"portunusmcp-prod-render-{uuid.uuid4().hex[:8]}"
+
+    assert (
+        _render(env_file, project)["services"]["gateway"]["environment"]["ENFORCEMENT_MODE"]
+        == "enforce"
+    )
+    env_file.write_text(env_file.read_text().replace("ENFORCEMENT_MODE=enforce", ""))
+    missing = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            str(env_file),
+            "-p",
+            project,
+            "-f",
+            str(COMPOSE),
+            "config",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert missing.returncode != 0
+    assert "ENFORCEMENT_MODE" in missing.stderr
+
+    with env_file.open("a") as target:
+        target.write("ENFORCEMENT_MODE=observe\n")
+    assert (
+        _render(env_file, project)["services"]["gateway"]["environment"]["ENFORCEMENT_MODE"]
+        == "observe"
+    )
+
+
 async def _wait_ready(url: str) -> None:
     async with httpx.AsyncClient() as client:
         for _ in range(180):
@@ -247,6 +284,7 @@ async def test_production_compose_is_hardened_and_calls_a_tool(tmp_path: Path) -
     assert services["grafana"]["image"].startswith("grafana/grafana:12.0.2@sha256:")
     assert "GRAFANA_ADMIN_PASSWORD" not in services["gateway"]["environment"]
     assert services["gateway"]["environment"]["FORWARDED_ALLOW_IPS"] == "*"
+    assert services["gateway"]["environment"]["ENFORCEMENT_MODE"] == "enforce"
     for service in ALL_SERVICES:
         assert services[service]["read_only"] is True
         assert services[service]["cap_drop"] == ["ALL"]

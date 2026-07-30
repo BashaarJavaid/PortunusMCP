@@ -36,6 +36,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://portunusmcp:portunusmcp@postgres:5432/portunusmcp}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      ENFORCEMENT_MODE: ${ENFORCEMENT_MODE:-enforce}
       # Upstream container specs live in the policy's `servers:` block (item 39).
       POLICY_FILE: ${POLICY_FILE:-policies/example-policy.yaml}
       # Signed-identity secret for the demo policy's ci-agent (item 34): the YAML

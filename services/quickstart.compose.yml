@@ -1,7 +1,4 @@
-# Single-host, single-gateway-replica production profile.
-# TLS termination and backups are operator responsibilities. The Docker socket is
-# root-equivalent host access; see ADR-007 and THREAT_MODEL.md before deploying.
-name: portunusmcp-prod
+name: ${QUICKSTART_NAMESPACE}
 
 x-security: &security
   read_only: true
@@ -17,11 +14,11 @@ x-logging: &logging
 services:
   postgres:
     <<: *security
-    image: postgres:16@${POSTGRES_IMAGE_DIGEST:?set POSTGRES_IMAGE_DIGEST to sha256:...}
+    image: ${POSTGRES_IMAGE}
     user: "999:999"
     environment:
       POSTGRES_USER: portunusmcp
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a URL-safe POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: portunusmcp
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -42,10 +39,10 @@ services:
 
   redis:
     <<: *security
-    image: redis:7@${REDIS_IMAGE_DIGEST:?set REDIS_IMAGE_DIGEST to sha256:...}
+    image: ${REDIS_IMAGE}
     user: "999:999"
     environment:
-      REDISCLI_AUTH: ${REDIS_PASSWORD:?set a URL-safe REDIS_PASSWORD}
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
     command:
       - sh
       - -ec
@@ -66,7 +63,7 @@ services:
 
   migrate:
     <<: *security
-    image: ghcr.io/bashaarjavaid/portunusmcp@${GATEWAY_IMAGE_DIGEST:?set GATEWAY_IMAGE_DIGEST to sha256:...}
+    image: ${GATEWAY_IMAGE}
     command: alembic upgrade head
     environment:
       DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
@@ -80,20 +77,54 @@ services:
       postgres:
         condition: service_healthy
 
+  keys-init:
+    <<: *security
+    image: ${GATEWAY_IMAGE}
+    user: "0:0"
+    cap_add: [SETUID, SETGID]
+    entrypoint: [sh, -ec]
+    command:
+      - |
+        chmod 0777 /runtime
+        setpriv --reuid="$$HOST_UID" --regid="$$HOST_GID" --clear-groups sh -ec '
+          mkdir -p /runtime/owned/public
+          chmod 0700 /runtime/owned /runtime/owned/public
+          if [ ! -e /runtime/owned/audit_signing_key.pem ]; then
+            cp /seed/audit_signing_key.pem /runtime/owned/audit_signing_key.pem
+          fi
+          for source in /seed/public/*.pub.pem; do
+            [ -f "$$source" ] || continue
+            destination="/runtime/owned/public/$${source##*/}"
+            [ -e "$$destination" ] || cp "$$source" "$$destination"
+          done
+          chmod 0600 /runtime/owned/audit_signing_key.pem
+          chmod 0444 /runtime/owned/public/*.pub.pem
+        '
+        chmod 0711 /runtime
+    environment:
+      HOST_UID: ${HOST_UID}
+      HOST_GID: ${HOST_GID}
+    volumes:
+      - ${SECRETS_DIR}:/seed:ro
+      - auditkeys:/runtime
+    network_mode: none
+    restart: "no"
+    mem_limit: 64m
+    cpus: 0.1
+    pids_limit: 32
+    logging: *logging
+
   gateway:
     <<: *security
-    image: ghcr.io/bashaarjavaid/portunusmcp@${GATEWAY_IMAGE_DIGEST:?set GATEWAY_IMAGE_DIGEST to sha256:...}
-    scale: 1
-    env_file:
-      - ${GATEWAY_ENV_FILE:-.env.prod.gateway}
+    image: ${GATEWAY_IMAGE}
+    user: "${HOST_UID}:${HOST_GID}"
     environment:
       DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
       REDIS_URL: redis://default:${REDIS_PASSWORD}@redis:6379/0
-      ENFORCEMENT_MODE: ${ENFORCEMENT_MODE:?set ENFORCEMENT_MODE to enforce or observe}
       POLICY_FILE: /app/config/policy.yaml
       POLICY_REVISIONS_DIR: /app/config/revisions
-      SIGNING_KEY_FILE: /app/secrets/audit_signing_key.pem
-      SIGNING_PUBLIC_KEYS_DIR: /app/secrets/public
+      SIGNING_KEY_FILE: /app/key-volume/owned/audit_signing_key.pem
+      SIGNING_PUBLIC_KEYS_DIR: /app/key-volume/owned/public
       MAX_MCP_BODY_BYTES: ${MAX_MCP_BODY_BYTES}
       MAX_JSON_DEPTH: ${MAX_JSON_DEPTH}
       MAX_SESSIONS_PER_IDENTITY: ${MAX_SESSIONS_PER_IDENTITY}
@@ -110,7 +141,7 @@ services:
       REPLAY_WINDOW_SECONDS: ${REPLAY_WINDOW_SECONDS}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
-      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:?set FORWARDED_ALLOW_IPS}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS}
       BUSINESS_HOURS_START_UTC: ${BUSINESS_HOURS_START_UTC}
       BUSINESS_HOURS_END_UTC: ${BUSINESS_HOURS_END_UTC}
       RISK_FREQ_WINDOW_SECONDS: ${RISK_FREQ_WINDOW_SECONDS}
@@ -126,18 +157,18 @@ services:
       APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS}
       STEP_UP_TTL_SECONDS: ${STEP_UP_TTL_SECONDS}
       METRICS_HOST: 0.0.0.0
-      UPSTREAM_RUNTIME_NAMESPACE: ${UPSTREAM_RUNTIME_NAMESPACE:?set UPSTREAM_RUNTIME_NAMESPACE}
+      UPSTREAM_RUNTIME_NAMESPACE: ${QUICKSTART_NAMESPACE}
       DOCKER_HOST: unix:///var/run/docker.sock
     group_add:
-      - ${DOCKER_GID:?set DOCKER_GID to the docker.sock group id}
+      - ${DOCKER_GID}
     volumes:
-      - ${POLICY_DIR_HOST:?set POLICY_DIR_HOST}:/app/config
-      - ${AUDIT_SIGNING_KEY_DIR:?set AUDIT_SIGNING_KEY_DIR}:/app/secrets
+      - ${CONFIG_DIR}:/app/config
+      - auditkeys:/app/key-volume
       - /var/run/docker.sock:/var/run/docker.sock
     tmpfs:
-      - /tmp:uid=1000,gid=1000,mode=1777
+      - /tmp:uid=${HOST_UID},gid=${HOST_GID},mode=1777
     ports:
-      - 127.0.0.1:${GATEWAY_PORT:-8000}:8000
+      - 127.0.0.1:${GATEWAY_PORT}:8000
     networks: [edge, data]
     restart: unless-stopped
     mem_limit: 1g
@@ -146,6 +177,8 @@ services:
     logging: *logging
     depends_on:
       migrate:
+        condition: service_completed_successfully
+      keys-init:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
@@ -163,19 +196,20 @@ services:
 
   verifier:
     <<: *security
-    image: ghcr.io/bashaarjavaid/portunusmcp@${GATEWAY_IMAGE_DIGEST:?set GATEWAY_IMAGE_DIGEST to sha256:...}
+    image: ${GATEWAY_IMAGE}
+    user: "${HOST_UID}:${HOST_GID}"
     command: python scripts/audit_verifier_daemon.py
     environment:
       DATABASE_URL: postgresql+asyncpg://portunusmcp:${POSTGRES_PASSWORD}@postgres:5432/portunusmcp
-      SIGNING_PUBLIC_KEYS_DIR: /app/secrets/public
+      SIGNING_PUBLIC_KEYS_DIR: /app/key-volume/owned/public
       VERIFY_INTERVAL_SECONDS: ${VERIFY_INTERVAL_SECONDS}
       METRICS_PORT: "9101"
       METRICS_HOST: 0.0.0.0
     volumes:
-      - ${AUDIT_SIGNING_KEY_DIR:?set AUDIT_SIGNING_KEY_DIR}/public:/app/secrets/public:ro
+      - auditkeys:/app/key-volume:ro
     tmpfs:
-      - /tmp:uid=1000,gid=1000,mode=1777
-    networks: [edge, data]
+      - /tmp:uid=${HOST_UID},gid=${HOST_GID},mode=1777
+    networks: [data]
     restart: unless-stopped
     mem_limit: 256m
     cpus: 0.25
@@ -184,51 +218,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-
-  prometheus:
-    <<: *security
-    image: prom/prometheus:v3.4.1@${PROMETHEUS_IMAGE_DIGEST:?set PROMETHEUS_IMAGE_DIGEST to sha256:...}
-    profiles: [monitoring]
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
-      - prometheusdata:/prometheus
-    ports:
-      - 127.0.0.1:${PROMETHEUS_PORT:-9090}:9090
-    networks: [edge]
-    restart: unless-stopped
-    mem_limit: 512m
-    cpus: 0.5
-    pids_limit: 128
-    logging: *logging
-    depends_on:
-      gateway:
-        condition: service_healthy
-
-  grafana:
-    <<: *security
-    image: grafana/grafana:12.0.2@${GRAFANA_IMAGE_DIGEST:?set GRAFANA_IMAGE_DIGEST to sha256:...}
-    profiles: [monitoring]
-    environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "false"
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?set GRAFANA_ADMIN_USER}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
-    volumes:
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
-      - grafanadata:/var/lib/grafana
-    tmpfs:
-      - /tmp
-    ports:
-      - 127.0.0.1:${GRAFANA_PORT:-3000}:3000
-    networks: [edge]
-    restart: unless-stopped
-    mem_limit: 512m
-    cpus: 0.5
-    pids_limit: 128
-    logging: *logging
-    depends_on: [prometheus]
+      keys-init:
+        condition: service_completed_successfully
 
 networks:
   edge:
@@ -238,5 +229,4 @@ networks:
 volumes:
   pgdata:
   redisdata:
-  prometheusdata:
-  grafanadata:
+  auditkeys:

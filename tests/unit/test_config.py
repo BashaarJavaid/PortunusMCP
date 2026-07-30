@@ -30,3 +30,14 @@ def test_edge_allowlists_parse_json_environment(monkeypatch: pytest.MonkeyPatch)
     configured = Settings()
     assert configured.allowed_hosts == ["gateway.example"]
     assert configured.allowed_origins == ["https://client.example"]
+
+
+@pytest.mark.parametrize("mode", ["enforce", "observe"])
+def test_enforcement_mode_accepts_only_documented_values(mode: str) -> None:
+    assert Settings(enforcement_mode=mode).enforcement_mode.value == mode  # type: ignore[arg-type]
+
+
+def test_enforcement_mode_defaults_safe_and_rejects_unknown() -> None:
+    assert Settings().enforcement_mode.value == "enforce"
+    with pytest.raises(ValidationError):
+        Settings(enforcement_mode="disabled")  # type: ignore[arg-type]

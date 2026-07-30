@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from services.gateway import signing
 from services.gateway.audit_keys import AuditKeyStore
 from services.gateway.policy_operations import PolicyOperationStore
@@ -87,3 +89,21 @@ async def test_key_journal_discards_before_and_completes_after_handoff(
     assert active_id == rotation.new_key_id
     assert store.public_count() == 3
     assert store.read_journal() is None
+
+
+def test_existing_read_only_public_key_needs_no_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_key = signing.generate_private_key()
+    store = AuditKeyStore(str(tmp_path / "private.pem"), str(tmp_path / "public"))
+    store.public_dir.mkdir()
+    public_path = store.ensure_public(private_key.public_key())
+    original_chmod = Path.chmod
+
+    def reject_public_chmod(path: Path, mode: int) -> None:
+        if path == public_path:
+            raise PermissionError
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(Path, "chmod", reject_public_chmod)
+    assert store.ensure_public(private_key.public_key()) == public_path

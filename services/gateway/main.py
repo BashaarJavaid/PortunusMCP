@@ -39,7 +39,7 @@ from services.gateway.audit_log import AuditWriter
 from services.gateway.audit_verification import backfill_legacy_key_ids
 from services.gateway.config import settings
 from services.gateway.db import Approval, AuditLog, PolicyVersion, ToolBaseline, async_session
-from services.gateway.decision import Decision, DecisionOutcome, EventType
+from services.gateway.decision import Decision, DecisionMode, DecisionOutcome, EventType
 from services.gateway.drift_detector import (
     REMOVED_SENTINEL,
     DriftDetector,
@@ -186,6 +186,8 @@ async def _record_startup_activation(engine: policy_engine.PolicyEngine) -> None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    mode_log = logger.warning if settings.enforcement_mode is DecisionMode.OBSERVE else logger.info
+    mode_log("enforcement_mode", mode=settings.enforcement_mode.value)
     # An invalid or missing policy file must fail startup (ARCHITECTURE.md §5);
     # so must a missing/unreadable audit signing key (§4.8, item 11).
     policy_operations = PolicyOperationStore(settings.policy_file)
@@ -633,6 +635,7 @@ async def explain_decision(body: ExplainRequest, request: Request) -> dict[str, 
         detector=request.app.state.drift_detector,
         risk=request.app.state.risk_engine,
         schema_cache=SchemaCache(request.app.state.redis),
+        mode=DecisionMode(settings.enforcement_mode),
     )
     return decision.model_dump(mode="json")
 

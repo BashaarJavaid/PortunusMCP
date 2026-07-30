@@ -26,6 +26,7 @@ from scripts.reset_dev_state import ResetError, reset_dev_state
 from services.gateway import auth, upstream_client
 from services.gateway.config import settings
 from services.gateway.db import engine
+from services.gateway.decision import DecisionMode
 from services.gateway.main import app
 from services.gateway.replay_guard import NONCE_META_KEY, TIMESTAMP_META_KEY
 
@@ -189,6 +190,7 @@ async def running_gateway(
     keys: dict[str, str],
     *,
     isolate_upstreams: bool = False,
+    mode: DecisionMode = DecisionMode.ENFORCE,
 ) -> AsyncIterator[Gateway]:
     """The gateway app on an ephemeral port with the given policy file and upstream.
     A policy without a `servers:` block (the single-server fixtures) gets the given
@@ -207,12 +209,14 @@ async def running_gateway(
     old_signing_pub = settings.signing_public_key_file
     old_signing_pub_dir = settings.signing_public_keys_dir
     old_revisions_dir = settings.policy_revisions_dir
+    old_enforcement_mode = settings.enforcement_mode
     settings.policy_file = str(policy_path)
     settings.policy_revisions_dir = str(policy_path.parent / "revisions")
     private_path, public_path = write_signing_keypair(policy_path.parent)
     settings.signing_key_file = str(private_path)
     settings.signing_public_key_file = str(public_path)
     settings.signing_public_keys_dir = str(policy_path.parent / "public")
+    settings.enforcement_mode = mode
 
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -242,6 +246,7 @@ async def running_gateway(
             settings.signing_public_key_file = old_signing_pub
             settings.signing_public_keys_dir = old_signing_pub_dir
             settings.policy_revisions_dir = old_revisions_dir
+            settings.enforcement_mode = old_enforcement_mode
             server.should_exit = True
             await task
 

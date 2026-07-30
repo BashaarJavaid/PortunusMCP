@@ -13,7 +13,7 @@ from prometheus_client import Counter, Histogram
 TOOL_CALLS = Counter(
     "portunusmcp_tool_calls",
     "Terminal tools/call decisions, labeled with the audit event type",
-    ["identity", "server", "tool", "decision"],
+    ["identity", "server", "tool", "decision", "mode"],
 )
 
 SCHEMA_DRIFT = Counter(

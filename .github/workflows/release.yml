@@ -68,6 +68,9 @@ jobs:
           /tmp/portunusmcp-wheel/bin/pip install dist/*.whl
           test "$(/tmp/portunusmcp-wheel/bin/portunusmcp --version)" = "portunusmcp ${{ steps.verify.outputs.version }}"
           /tmp/portunusmcp-wheel/bin/portunusmcp --help >/dev/null
+          /tmp/portunusmcp-wheel/bin/portunusmcp quickstart --help >/dev/null
+          /tmp/portunusmcp-wheel/bin/python -c \
+            'from importlib.resources import files; assert files("services").joinpath("quickstart.compose.yml").is_file()'
           heads="$(/tmp/portunusmcp-wheel/bin/alembic heads)"
           test "$heads" = "0007 (head)"
           echo "alembic_head=0007" >> "$GITHUB_OUTPUT"

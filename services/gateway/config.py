@@ -5,6 +5,8 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+from services.gateway.decision import DecisionMode
+
 
 class Settings(BaseSettings):
     # Defaults are local-dev only; the explicit demo/production Compose envs override them.
@@ -13,6 +15,8 @@ class Settings(BaseSettings):
     policy_file: str = "policies/example-policy.yaml"
     # Append-only revision snapshots written on every policy activation (§4.8, item 19).
     policy_revisions_dir: str = "policies/revisions"
+    # Process-wide and restart-required. Production Compose requires this explicitly.
+    enforcement_mode: DecisionMode = DecisionMode.ENFORCE
     schema_cache_ttl: int = 600
     session_idle_ttl: int = 300
     shutdown_grace_seconds: int = 5

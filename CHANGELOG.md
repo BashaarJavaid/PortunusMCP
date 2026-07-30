@@ -6,6 +6,22 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Added `portunusmcp quickstart`, a non-interactive, installed-CLI path from a local
+  stdio MCP image to independently verified canonical `ALLOW` and `DENY_RBAC`
+  Decisions on a generated loopback-only hardened stack.
+- Added restart-required `ENFORCEMENT_MODE=enforce|observe`. Observe runs the complete
+  call pipeline, audits the earliest would-be Decision with downstream risk data, and
+  forwards only after that audit succeeds; auth, resource/rate, deadline, upstream,
+  and audit gates remain enforcing.
+- Added `portunusmcp doctor <deployment-dir> [--fix]` for production and quickstart
+  deployment diagnostics, bounded safe repairs, stable JSON findings, and explicit
+  restart verification.
+- Added a non-root Python 3.12 devcontainer and Codespaces path that runs the existing
+  quickstart automatically with a dedicated persisted Docker-in-Docker daemon and
+  reuses generated state on rebuild.
+
 ## [0.1.0] - 2026-07-27
 
 ### Added

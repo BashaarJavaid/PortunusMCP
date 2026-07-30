@@ -138,20 +138,168 @@ The full version, including the assumptions the whole model rests on, is in [`TH
 
 | Threat | Protected? | How / why not |
 |---|---|---|
-| Unauthorized tool access by a known identity | Yes | RBAC + ABAC policy resolution |
-| Rogue / rug-pulling MCP server (schema mutation) | Yes | Drift Detector classifies mutations; High/Critical blocks at `tools/call` until re-approval |
-| Contextually risky calls by an *authorized* identity | Yes | Risk Engine — challenge / human approval / deny, by score band |
+| Unauthorized tool access by a known identity | **Enforce: Yes; Observe: No** | RBAC + ABAC block in `enforce`; `observe` audits the would-be denial and forwards |
+| Rogue / rug-pulling MCP server (schema mutation) | **Enforce: Yes; Observe: detects only** | Drift Detector classifies mutations; High/Critical blocks until re-approval only in `enforce` |
+| Contextually risky calls by an *authorized* identity | **Enforce: Yes; Observe: advisory** | Risk Engine computes the same score and outcome in both modes; only `enforce` holds or denies |
 | Audit-log tampering | Yes | Hash chain + per-row ECDSA signature; independently verified by a sidecar holding only the public key |
-| Replay of a captured request | **Yes for `signed` / Partial for `bearer`** | A `signed` request carries no credential: a byte-identical replay is deduped (`DENY_REPLAY`) and a fresh nonce cannot be re-signed (401 at the edge). `bearer` keeps opportunistic dedup only — the API key travels in the captured request |
-| Tool Poisoning (adversarial text in descriptions) | **Partial** | A description changed after approval blocks until re-approval (default High, item 36a); first-contact baselines are heuristically scanned — a hit is audited (`BASELINE_FLAGGED`) and raises every later call's risk, but flags never block and novel phrasing evades pattern lists. Descriptions still reach the LLM verbatim — Partial is the ceiling |
+| Replay of a captured request | **Enforce: Yes for `signed` / Partial for `bearer`; Observe: detects only** | The nonce check still runs and consumes nonces in `observe`, but a detected replay is forwarded. HTTP signature failures remain 401 in both modes |
+| Tool Poisoning (adversarial text in descriptions) | **Enforce: Partial; Observe: weaker advisory detection** | Changed descriptions block only in `enforce`; `observe` still scans, audits, and scores but forwards. Descriptions reach the LLM verbatim in both modes |
 | Compromised registered upstream reading gateway secrets | **Yes (scoped)** | Per-session hardened containers receive a minimal allowlisted environment and no gateway secrets directory, Docker socket, or DB/Redis credentials; host/gateway compromise remains out of scope |
 | DNS rebinding against Streamable HTTP | **Yes (scoped)** | The MCP SDK validates every `/mcp/*` Host and supplied Origin against configured allowlists before auth or parsing; the deployment must configure its real public names |
 | Authenticated resource exhaustion / stuck tools | **Partial** | Per-identity sessions, in-flight calls, fixed-window rate limits, bounded bodies/depth, and a 60s call deadline cap one identity; many identities can still exhaust the host, and a deadline cannot undo an upstream side effect already started |
 | Unauthenticated credential stuffing / auth-path availability | **Partial** | Bad bearer/signed credentials are fixed-window throttled by trusted-proxy-resolved source across MCP/admin and raise an alert; address rotation, initial concurrent bursts, and shared-NAT collateral remain |
 | Prompt injection via tool *results* | Partial | A protocol-layer gateway can log and rate-limit but not semantically evaluate result content — client/agent-framework responsibility |
-| Stolen API key | Partial | Behavioral risk factors reduce blast radius; a key alone can't be distinguished from its holder. A `signed` identity's secret never appears on the wire at all — stealing it means compromising a host environment |
+| Stolen API key | Partial | Source throttling remains active in both modes; behavioral risk blocks only in `enforce`. A `signed` identity's secret never appears on the wire at all |
 | Compromised gateway host | No | The attacker has the signing key — an infra hardening problem, not an application one |
 | Insider admin abusing legitimate access | No | Attributable and tamper-evident after the fact, not prevented; two-person activation is designed, not built |
+
+---
+
+## Quickstart
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/BashaarJavaid/PortunusMCP?ref=main&quickstart=1)
+
+### Devcontainer and Codespaces
+
+GitHub Codespaces needs no local install: use the badge and wait for creation to finish.
+For local use, install only Docker, VS Code, and the Dev Containers extension, then run
+**Dev Containers: Reopen in Container**. Both paths start a non-root Python 3.12
+workspace, a dedicated Docker-in-Docker daemon, and this repository's existing
+quickstart against the harmless `read_file` sample. Creation succeeds only after the
+log contains canonical `ALLOW` and `DENY_RBAC` Decisions, a verified audit export, and
+a healthy `doctor` result.
+
+Generated state stays in the ignored `./portunusmcp-quickstart/` directory. Rebuilding
+the devcontainer reuses its namespace, credentials, keys, and database volumes; the
+post-create script never repairs or destroys existing state. Load credentials without
+printing them:
+
+```bash
+cd ./portunusmcp-quickstart
+set -a && source ./credentials.env && set +a
+```
+
+If creation fails, its final output includes doctor findings and exact commands. The
+equivalent state-preserving recovery and explicit destructive reset are:
+
+```bash
+state=./portunusmcp-quickstart
+project="$(awk -F"'" '/^QUICKSTART_NAMESPACE=/{print $2}' "$state/.env.quickstart")"
+docker compose --env-file "$state/.env.quickstart" -p "$project" \
+  -f "$state/compose.quickstart.yml" up -d --wait --pull never
+portunusmcp doctor "$state"
+
+# Destructive: delete the generated named volumes, then the generated files.
+docker compose --env-file "$state/.env.quickstart" -p "$project" \
+  -f "$state/compose.quickstart.yml" down --volumes
+rm -rf -- ./portunusmcp-quickstart
+```
+
+Port 8000 is forwarded silently and remains private by default. In browser Codespaces,
+use loopback from the integrated terminal (for example,
+`curl http://127.0.0.1:8000/ready`): the authenticated `*.app.github.dev` hostname is
+deliberately outside quickstart's Host allowlist. Local VS Code can use its
+`localhost:8000` tunnel.
+
+The Docker-in-Docker feature runs the devcontainer privileged, and its Docker daemon
+gives the workspace root-equivalent control of that environment. Only open trusted
+repository code and use trusted upstream images; `postCreateCommand` runs repository
+code automatically.
+
+### Existing Python and Docker
+
+`portunusmcp quickstart` is the evaluation path from an existing local stdio MCP image
+to one verified `ALLOW` and one verified `DENY_RBAC`. It creates and starts the real
+PostgreSQL, Redis, migration, gateway, and audit-verifier stack; it is not a
+SQLite-shaped substitute for the production deployment.
+
+Prerequisites:
+
+- Python 3.12 with `portunusmcp` installed from PyPI.
+- Docker Engine and Docker Compose with `/var/run/docker.sock` available (tested
+  release line: Engine 29.x and Compose 5.x).
+- Linux amd64/arm64 or macOS arm64, running as a non-root user.
+- Internet access for the three immutable release images, plus a pre-existing local
+  image containing the upstream MCP server. Quickstart never pulls the upstream.
+
+For example, against a local image whose `echo` tool accepts `{"text": ...}`:
+
+```bash
+portunusmcp --timeout 300 quickstart \
+  --upstream-image my-local-mcp:latest \
+  --allow-tool echo \
+  --arguments '{"text":"hello"}' \
+  --output-dir ./portunusmcp-quickstart \
+  --command python -m my_mcp_server
+```
+
+`--command` must be last; everything after it is passed as argv without a shell.
+Quickstart resolves the supplied image to its local immutable `sha256:...` image ID,
+generates two 256-bit bearer credentials and a fingerprint-addressed audit key, binds
+the gateway only to `127.0.0.1:8000`, disables upstream networking and environment
+passthrough, then prints the full canonical Decisions after independently verifying
+the audit export. Raw credentials are written only to the mode-`0600`
+`portunusmcp-quickstart/credentials.env` file:
+
+```bash
+cd ./portunusmcp-quickstart
+set -a && source ./credentials.env && set +a
+# PORTUNUSMCP_URL=http://127.0.0.1:8000
+# MCP endpoint: http://127.0.0.1:8000/mcp/default
+```
+
+The private mode-`0700` work directory also contains `compose.quickstart.yml`,
+`.env.quickstart`, `config/policy.yaml`, the revision directory, and
+`secrets/audit_signing_key.pem` plus its public-key ring. A successful run leaves the
+stack running and prints exact start/restart, state-preserving stop, and destructive
+reset commands. Their shapes are:
+
+```bash
+docker compose --env-file .env.quickstart -p <printed-namespace> -f compose.quickstart.yml down
+docker compose --env-file .env.quickstart -p <printed-namespace> -f compose.quickstart.yml down --volumes
+```
+
+The second command deletes PostgreSQL, Redis, and runtime audit-key named volumes; the
+generated host key files remain. The mounted Docker socket grants the gateway
+root-equivalent control of the host; only trusted operators and upstream images should
+use it. Quickstart is an evaluation/on-ramp profile, not a replacement for the
+hardened, operator-configured [`compose.prod.yml`](./compose.prod.yml).
+
+---
+
+## Diagnose a deployment
+
+Run `doctor` from a generated quickstart directory or a production bundle directory:
+
+```bash
+portunusmcp doctor .
+portunusmcp doctor . --fix
+```
+
+It checks the local Docker socket and tested version lines, Compose rendering, socket
+GID and runtime namespace, policy/audit-key paths and modes, the complete fingerprinted
+public-key ring, policy-referenced gateway environment variables, immutable locally
+available upstream images, named volumes, loopback ports, `FORWARDED_ALLOW_IPS`, and
+`/ready` when the gateway is running. A stopped stack is informational, not unhealthy.
+
+`--fix` offers only unambiguous local repairs: mode-`0700` directories, mode-`0600`
+private/config files, mode-`0444` archived public keys, pristine initial audit keys, a
+missing active public archive, and exactly inferable Docker GID or namespace values.
+It prompts once; automation must put the global flags before the command:
+
+```bash
+portunusmcp --yes doctor . --fix
+portunusmcp --json --yes doctor . --fix
+```
+
+Exit status is `0` when no `ERROR` remains and `1` otherwise; warnings do not fail the
+run. Repairs that affect an existing stack do not restart it. Doctor exits unhealthy
+and prints the exact `docker compose ... --force-recreate gateway verifier` command to
+run, after which a second `doctor` verifies readiness. Missing secrets, ambiguous
+namespaces, ownership changes, unavailable images, missing volumes, port conflicts,
+and corrupt or historically incomplete key material remain explicit operator
+decisions; doctor never guesses, pulls images, creates volumes, or uses ambient secret
+environment variables to hide a missing deployment value.
 
 ---
 
@@ -191,16 +339,30 @@ If later demo policy v1 content conflicts with recorded state, the fail-closed a
 
 `compose.prod.yml` is a hardened **single-host, single-gateway-replica** profile. It is intentionally not selected by a bare `docker compose up`: every invocation names the production file and env explicitly.
 
+> **Warning:** `ENFORCEMENT_MODE=observe` forwards calls that RBAC, ABAC, replay,
+> drift, risk, or parameter validation would deny. Use it only to learn policy impact;
+> authenticated source/tool rate limits, session/resource limits, deadlines, upstream
+> availability, and audit-before-action remain enforcing.
+
 ```bash
 cp .env.prod.example .env.prod
 cp .env.prod.gateway.example .env.prod.gateway
 chmod 600 .env.prod .env.prod.gateway
 # Fill every required password, digest, allowlist, path, namespace and Docker GID.
+# Keep ENFORCEMENT_MODE=enforce, or deliberately set observe for an audit-only trial.
 
 docker compose --env-file .env.prod -f compose.prod.yml config
 docker compose --env-file .env.prod -f compose.prod.yml pull
 docker compose --env-file .env.prod -f compose.prod.yml up -d
 ```
+
+`ENFORCEMENT_MODE` is process-wide and accepts only `enforce` or `observe`. The
+bare-host and demo defaults are `enforce`; production Compose refuses to render
+without an explicit value. Switching mode requires recreating/restarting the gateway:
+changing policy or sending SIGHUP does not change it. In observe mode `tools/list`
+serves the full upstream list, and each `tools/call` audit Decision records
+`"mode":"observe"` plus the earliest would-be terminal and downstream risk score/factors.
+The upstream result itself is returned unchanged.
 
 The tagged production bundle fills every service image with the exact manifest digest
 tested by the release workflow; the source-tree env example keeps placeholders for
@@ -237,6 +399,7 @@ The item-40/43 edge settings are environment-backed; all numeric values must be 
 
 | Setting | Default |
 |---|---:|
+| `ENFORCEMENT_MODE` | `enforce` (explicitly required by production Compose) |
 | `MAX_MCP_BODY_BYTES` | `1048576` |
 | `MAX_JSON_DEPTH` | `32` |
 | `MAX_SESSIONS_PER_IDENTITY` | `3` |
@@ -328,9 +491,9 @@ Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms
 
 ## Roadmap
 
-Phases 1–6 are complete. The Phase 7 blockers (items 44–47) are also complete: [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 48, `portunusmcp quickstart`, is next.
+Phases 1–6 and Phase 7 items 44–50 are complete. [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 51's implementation candidate has passed local macOS acceptance and is awaiting Codespaces acceptance before it can close.
 
-Items through Phase 6 are complete only when their verification passes and the corresponding threat-model claim is earned. Phase 7 does not upgrade threat-model rows; its adoption items verify against observed friction and the phase closes after five outside users complete `quickstart` and their friction is triaged.
+Items through Phase 6 are complete only when their verification passes and the corresponding threat-model claim is earned. Phase 7 verifies against observed friction; item 49's observe mode is the explicit exception that weakens and therefore qualifies existing threat-model claims. The phase closes after five outside users complete `quickstart` and their friction is triaged.
 
 ## License
 
