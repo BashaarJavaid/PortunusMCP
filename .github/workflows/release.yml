@@ -69,6 +69,7 @@ jobs:
           test "$(/tmp/portunusmcp-wheel/bin/portunusmcp --version)" = "portunusmcp ${{ steps.verify.outputs.version }}"
           /tmp/portunusmcp-wheel/bin/portunusmcp --help >/dev/null
           /tmp/portunusmcp-wheel/bin/portunusmcp quickstart --help >/dev/null
+          /tmp/portunusmcp-wheel/bin/portunusmcp policy scaffold --help >/dev/null
           /tmp/portunusmcp-wheel/bin/python -c \
             'from importlib.resources import files; assert files("services").joinpath("quickstart.compose.yml").is_file()'
           heads="$(/tmp/portunusmcp-wheel/bin/alembic heads)"

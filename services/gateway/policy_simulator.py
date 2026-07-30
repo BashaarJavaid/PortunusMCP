@@ -78,19 +78,21 @@ class CompareSimulation(BaseModel):
     sample_diffs: list[SampleDiff]
 
 
-def parse_window(window: str) -> tuple[datetime, datetime]:
+def parse_window(window: str, field_label: str = "replay_window") -> tuple[datetime, datetime]:
     """Inclusive UTC date range 'YYYY-MM-DD..YYYY-MM-DD' -> [start, end) datetimes
     (the exclusive end is the day after the inclusive end date). Raises ValueError."""
     try:
         start_s, end_s = window.split("..")
+        if len(start_s) != 10 or len(end_s) != 10:
+            raise ValueError
         start = datetime.strptime(start_s, "%Y-%m-%d").replace(tzinfo=UTC)
         end = datetime.strptime(end_s, "%Y-%m-%d").replace(tzinfo=UTC)
     except ValueError:
         raise ValueError(
-            f"replay_window must be 'YYYY-MM-DD..YYYY-MM-DD', got {window!r}"
+            f"{field_label} must be 'YYYY-MM-DD..YYYY-MM-DD', got {window!r}"
         ) from None
     if start > end:
-        raise ValueError(f"replay_window start {start_s} is after its end {end_s}")
+        raise ValueError(f"{field_label} start {start_s} is after its end {end_s}")
     return start, end + timedelta(days=1)
 
 

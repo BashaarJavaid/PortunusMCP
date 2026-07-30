@@ -198,12 +198,13 @@ async def running_gateway(
     policy = yaml.safe_load(policy_path.read_text())
     if "servers" not in policy:
         policy["servers"] = {"default": server_spec(upstream_command)}
-    else:
+        policy_path.write_text(yaml.safe_dump(policy))
+    elif any(isinstance(server, str) for server in policy["servers"].values()):
         policy["servers"] = {
             server_id: server_spec(server) if isinstance(server, str) else server
             for server_id, server in policy["servers"].items()
         }
-    policy_path.write_text(yaml.safe_dump(policy))
+        policy_path.write_text(yaml.safe_dump(policy))
     old_policy_file = settings.policy_file
     old_signing_key = settings.signing_key_file
     old_signing_pub = settings.signing_public_key_file

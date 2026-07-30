@@ -7,14 +7,16 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import ssl
 import sys
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from services import doctor, quickstart
 from services.gateway.audit_export import verify_file
@@ -142,6 +144,11 @@ def _parser() -> argparse.ArgumentParser:
     simulate = policy.add_parser("simulate")
     simulate.add_argument("file")
     simulate.add_argument("--window", required=True)
+    scaffold = policy.add_parser("scaffold")
+    scaffold.add_argument("--from-audit", action="store_true", required=True)
+    scaffold.add_argument("--window", required=True)
+    scaffold.add_argument("--output", required=True)
+    scaffold.add_argument("--force", action="store_true")
     compare = policy.add_parser("compare")
     compare.add_argument("old", type=_positive_int)
     compare.add_argument("new", type=_positive_int)
@@ -269,12 +276,11 @@ def _call(args: argparse.Namespace, client: Client) -> Any:
         if action in {"validate", "simulate", "rollout"}:
             path = {
                 "validate": "/admin/policy/validate",
-                "simulate": (
-                    "/admin/policy/simulate-candidate?"
-                    + urllib.parse.urlencode({"replay_window": args.window})
-                ),
+                "simulate": "/admin/policy/simulate-candidate",
                 "rollout": "/admin/policy/rollout",
             }[action]
+            if action == "simulate":
+                path += "?" + urllib.parse.urlencode({"replay_window": args.window})
             return client.request(
                 "POST", path, body=_read(args.file), content_type="application/yaml"
             )
@@ -294,9 +300,6 @@ def _call(args: argparse.Namespace, client: Client) -> Any:
 
 
 def _export(args: argparse.Namespace, client: Client) -> dict[str, Any]:
-    output = Path(args.output)
-    if output.exists() and not args.force:
-        raise CLIError(f"{output} already exists; pass --force to replace it")
     query = {
         key: value
         for key, value in (("from_seq", args.from_seq), ("to_seq", args.to_seq))
@@ -305,20 +308,66 @@ def _export(args: argparse.Namespace, client: Client) -> dict[str, Any]:
     path = "/admin/audit/export"
     if query:
         path += "?" + urllib.parse.urlencode(query)
+
+    def write(stream: BinaryIO) -> None:
+        client.request("GET", path, stream_to=stream)
+
+    count, anchored = _atomic_output(args.output, args.force, write, verify_file)
+    return {"output": args.output, "rows": count, "genesis_anchored": anchored}
+
+
+def _atomic_output(
+    output_name: str,
+    force: bool,
+    write: Callable[[BinaryIO], Any],
+    validate: Callable[[Path], Any] | None = None,
+) -> Any:
+    output = Path(output_name)
+    if output.exists() and not force:
+        raise CLIError(f"{output} already exists; pass --force to replace it")
     output.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
-            client.request("GET", path, stream_to=stream)
+            write(stream)
             stream.flush()
             os.fsync(stream.fileno())
-        count, anchored = verify_file(temporary)
+        result = validate(temporary) if validate is not None else None
         temporary.chmod(0o600)
         os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)
-    return {"output": str(output), "rows": count, "genesis_anchored": anchored}
+    return result
+
+
+def _scaffold(args: argparse.Namespace, client: Client) -> dict[str, Any]:
+    output = Path(args.output)
+    if output.exists() and not args.force:
+        raise CLIError(f"{output} already exists; pass --force to replace it")
+    response = client.request(
+        "POST",
+        "/admin/policy/scaffold",
+        body=json.dumps({"source": "audit", "window": args.window}).encode(),
+        content_type="application/json",
+    )
+    try:
+        policy = response["policy"]
+        metadata = response["metadata"]
+        expected_hash = metadata["candidate"]["content_hash"]
+        if not isinstance(policy, str) or not isinstance(metadata, dict):
+            raise TypeError
+    except (KeyError, TypeError):
+        raise CLIError("gateway returned an invalid scaffold response") from None
+    raw = policy.encode()
+    if hashlib.sha256(raw).hexdigest() != expected_hash:
+        raise CLIError("generated policy hash does not match gateway metadata")
+
+    def write(stream: BinaryIO) -> None:
+        stream.write(raw)
+
+    _atomic_output(args.output, args.force, write)
+    return {"output": args.output, "metadata": metadata}
 
 
 def _human(result: Any, args: argparse.Namespace) -> str:
@@ -328,6 +377,20 @@ def _human(result: Any, args: argparse.Namespace) -> str:
         return quickstart.human(result)
     if args.group == "keys" and args.action == "generate":
         return "\n".join(f"{key}: {value}" for key, value in result.items())
+    if args.group == "policy" and args.action == "scaffold":
+        candidate = result["metadata"]["candidate"]
+        return "\n".join(
+            (
+                f"Policy scaffold written to {result['output']}",
+                (
+                    f"Identities: {candidate['identity_count']}; "
+                    f"grants: {candidate['grant_count']}; "
+                    f"server-tools: {candidate['server_tool_count']}"
+                ),
+                f"SHA-256: {candidate['content_hash']}",
+                f"Next: {shlex.join(['portunusmcp', 'policy', 'validate', result['output']])}",
+            )
+        )
     if args.group == "baselines" and args.action == "show":
         old = json.dumps(result["approved_schema"], indent=2, sort_keys=True).splitlines(True)
         if result["removed"]:
@@ -366,6 +429,8 @@ def main(argv: list[str] | None = None) -> int:
             result = (
                 _export(args, client)
                 if args.group == "audit" and args.action == "export"
+                else _scaffold(args, client)
+                if args.group == "policy" and args.action == "scaffold"
                 else _call(args, client)
             )
         print(

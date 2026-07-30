@@ -7,6 +7,13 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      benchmark_n:
+        description: Calls per benchmark scenario
+        required: true
+        default: 1000
+        type: number
 
 jobs:
   devcontainer:
@@ -97,7 +104,9 @@ jobs:
 
   benchmark:
     # §9: on merge to main only, never per-PR, to keep PR CI fast.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -126,6 +135,7 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://portunusmcp:portunusmcp@localhost:5432/portunusmcp
       REDIS_URL: redis://localhost:6379/0
       UPSTREAM_RUNTIME_NAMESPACE: portunusmcp-benchmark
+      BENCHMARK_N: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_n || 100 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -137,7 +147,7 @@ jobs:
       # runner; the fixed 10/50/100-session concurrency scenarios are unaffected.
       # Runner numbers track regressions between runs, they don't replace the
       # measured numbers in the README's Performance section.
-      - run: python -m tests.benchmarks.run 100
+      - run: python -m tests.benchmarks.run "$BENCHMARK_N"
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-report

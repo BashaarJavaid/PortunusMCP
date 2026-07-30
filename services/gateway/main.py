@@ -29,6 +29,7 @@ from services.gateway import (
     decision_explainer,
     logging_config,
     policy_engine,
+    policy_scaffold,
     policy_simulator,
     policy_versions,
     upstream_client,
@@ -679,6 +680,27 @@ async def simulate_policy(
     except policy_versions.ActivationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return result.model_dump(mode="json")
+
+
+@app.post("/admin/policy/scaffold")
+async def scaffold_policy(
+    body: policy_scaffold.ScaffoldRequest, request: Request
+) -> dict[str, object]:
+    await _require_admin(request)
+    try:
+        return await policy_scaffold.scaffold(
+            body.source,
+            body.window,
+            store=request.app.state.policy_store,
+            sessionmaker=async_session,
+            key_store=request.app.state.audit_key_store,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except policy_scaffold.ScaffoldTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except policy_scaffold.ScaffoldConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _require_yaml(request: Request) -> None:
