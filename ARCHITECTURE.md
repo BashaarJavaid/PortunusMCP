@@ -118,7 +118,7 @@ Every terminal outcome from the pipeline above — whether returned as a JSON-RP
 
 ### 4.4 Component diagram
 
-Every box inside the gateway subgraph is a module in `services/gateway/` with the same name. The pipeline stages (numbered) are wired in §4.2 order by the JSON-RPC Interceptor; the admin-surface components (Approvals, Decision Explainer, Policy Simulator) sit off the live request path.
+Every box inside the gateway subgraph is a module in `services/gateway/` with the same name. The pipeline stages (numbered) are wired in §4.2 order by the JSON-RPC Interceptor; the admin-surface components (Approvals, Decision Explainer, Policy Simulator, Policy Scaffolder) sit off the live request path.
 
 ```mermaid
 graph TD
@@ -138,6 +138,7 @@ graph TD
         Approvals["Approvals lifecycle (admin API)"]
         Explainer["Decision Explainer (admin API)"]
         Simulator["Policy Simulator (admin API)"]
+        Scaffolder["Policy Scaffolder (admin API)"]
     end
 
     UpClient --> Docker["Local Docker daemon (Unix socket)"]
@@ -154,6 +155,7 @@ graph TD
     Approvals --> PG
     Explainer --> PG
     Simulator --> PG
+    Scaffolder --> PG
     Policy --> Rev["policies/revisions/ snapshots (rw submount)"]
     Simulator --> Rev
 
@@ -490,6 +492,27 @@ POST /admin/policy/simulate
 
 This is the enterprise-grade version of the same idea — instead of only validating a candidate against reality, it answers "how did this policy actually evolve between v2 and v5, in terms of real request outcomes," which is a materially different and more useful question once a policy has gone through several revisions.
 
+**Audit-derived policy scaffold (item 52)** — `POST /admin/policy/scaffold`
+turns exact observe-mode terminal rows into a review-only RBAC candidate. The
+gateway captures the active raw policy and highest revision, resolves the audit
+sequence bounds for an inclusive UTC date window, then streams that full contiguous
+span without a row cap. Every row is checked with the shared verifier for sequence
+continuity, hash links, signature/fingerprint, and protected-column projections before
+an `(identity, server, tool)` tuple can contribute a grant. A range beginning at
+sequence 1 is genesis-anchored and prefix-attested; a partial range explicitly is not.
+
+Only `ALLOW`, `DENY_*`, `CHALLENGE`, and `HUMAN_APPROVAL_REQUIRED` rows carrying exact
+`mode: observe` qualify. Current server registrations and authored identity auth,
+admin, TOTP, and attribute fields are retained; unobserved non-admin identities are
+removed, current admins remain, old grants are replaced, `tool_sensitivity` becomes
+`{}`, and every generated grant gets empty conditions. Fixed warning/TODO comments
+make the missing sensitivity and ABAC review visible. The final bytes are parsed by
+the normal policy loader, bounded by the 1 MiB upload limit, hashed, and returned only
+if the active policy object/hash and revision maximum are unchanged. The endpoint is
+read-only: it writes no audit row and does not fully validate runtime images, simulate,
+activate, or change enforcement mode. It guarantees only the observed RBAC surface;
+drift, replay, validation, and risk remain independent runtime decisions.
+
 **Operator API and CLI (item 42)** — `services.cli:main` installs as `portunusmcp` and uses only `argparse`, `urllib`, TLS, JSON, and `difflib`. It exposes bounded approval and baseline review queues, decision explanation, raw-YAML policy validation/simulation/rollout, stored revision comparison/rollback, offline bearer/signed/TOTP credential generation, audit-key status/rotation, and verified audit export. Remote URLs require HTTPS; loopback HTTP is the development exception. The admin key comes only from `PORTUNUSMCP_ADMIN_KEY`; mutations confirm unless `--yes`, and JSON-mode mutations refuse to run without it.
 
 **Local deployment doctor (item 50)** — `portunusmcp doctor <deployment-dir> [--fix]` recognizes only the shipped production and generated quickstart shapes. It renders Compose through the local Docker CLI, reads policy secrets only from the deployed gateway environment, validates the canonical policy and audit-key ring, and checks Docker/socket compatibility, immutable local upstream images, namespaced existing volumes, file modes/ownership, loopback ports, forwarded-proxy trust, and live readiness. Safe repairs are local and atomic where configuration is rewritten; doctor never pulls images, creates volumes, changes ownership, replaces historical key material, chooses a namespace, or restarts services. If an applied repair can affect running containers, the report remains unhealthy until the operator runs its exact force-recreate command and doctor observes `/ready` afterward. Machine output uses stable `PASS`, `INFO`, `WARN`, `ERROR`, and `FIXED` findings and never includes secret values.
@@ -591,24 +614,53 @@ It also measures the **`tools/list` response size reduction** from schema prunin
 
 ### Results
 
-Measured **2026-07-27** from the item-43 working tree based on **`98e4a80`**, on Darwin 24.6.0 arm64 (Apple Silicon), Python 3.12.13, Postgres 16, Redis 7, and local Docker. Latencies are mean / p50 / p95 / p99.
+Measured at **N=1000 on 2026-07-30 from item-52 commit `387d72b`**.
+Latencies are mean / p50 / p95 / p99.
+
+**Local macOS arm64 — Darwin 24.6.0, Python 3.12.13; run
+`20260730T042941Z`.**
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 0.25 / 0.21 / 0.43 / 0.59 ms | 16.17 / 15.59 / 18.29 / 31.35 ms | 15.93 / 15.38 / 17.85 / 30.76 ms |
-| Single call, cold schema cache | 0.25 / 0.21 / 0.43 / 0.59 ms | 22.14 / 19.26 / 34.01 / 72.71 ms | — |
-| 10 concurrent sessions (p95) | — | 229.20 ms | — |
-| 50 concurrent sessions (p95) | — | 1171.36 ms | — |
-| 100 concurrent sessions (p95) | — | 5376.84 ms | — |
+| Single call, cached schema | 0.25 / 0.22 / 0.45 / 0.69 ms | 16.60 / 15.86 / 19.62 / 34.68 ms | 16.34 / 15.64 / 19.17 / 34.00 ms |
+| Single call, cold schema cache | 0.25 / 0.22 / 0.45 / 0.69 ms | 20.77 / 18.71 / 27.52 / 66.31 ms | — |
+| 10 concurrent sessions (p95) | — | 234.73 ms | — |
+| 50 concurrent sessions (p95) | — | 898.75 ms | — |
+| 100 concurrent sessions (p95) | — | 2636.79 ms | — |
 | `tools/list` payload size (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
 
-Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms. Peak RSS after the 100-session run: 153 MiB (gateway and harness share the process); aggregate initialized upstream-container memory: 1,095 MiB. High-concurrency p95 includes Docker container ownership plus synchronous fail-closed audit writes contending on the Postgres pool.
+Container initialization: first 426.66 ms; next 20 p50 331.40 ms / p95
+443.70 ms. Peak RSS: 149 MiB; aggregate upstream-container memory: 1,095 MiB.
+
+**GitHub-hosted Ubuntu x86_64 — Linux 6.17.0-1020-azure, Python 3.12.13;
+workflow run `30513931438`.**
+
+| Scenario | Direct call | Through gateway | Overhead |
+|---|---|---|---|
+| Single call, cached schema | 0.30 / 0.28 / 0.36 / 0.59 ms | 15.69 / 15.41 / 17.32 / 19.33 ms | 15.38 / 15.13 / 16.96 / 18.74 ms |
+| Single call, cold schema cache | 0.30 / 0.28 / 0.36 / 0.59 ms | 18.79 / 18.51 / 20.74 / 23.07 ms | — |
+| 10 concurrent sessions (p95) | — | 139.40 ms | — |
+| 50 concurrent sessions (p95) | — | 762.45 ms | — |
+| 100 concurrent sessions (p95) | — | 1534.57 ms | — |
+| `tools/list` payload size (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
+
+Container initialization: first 308.77 ms; next 20 p50 322.21 ms / p95
+338.83 ms. Peak RSS: 243 MiB; aggregate upstream-container memory: 1,087 MiB.
+High-concurrency p95 includes Docker container ownership plus synchronous fail-closed
+audit writes contending on the Postgres pool.
+
+The previous like-for-like local item-43 publication had 16.17 ms cached mean and
+18.29 ms cached p95. Item 52 measured 16.60 ms (+2.7%) and 19.62 ms (+7.3%);
+all other comparable mean/p95 metrics improved. No repeatable regression crossed the
+10% block threshold, so no rerun was required.
 
 These numbers are published in the README with the exact commit and date they were measured at, so a stale claim is visible as stale rather than quietly wrong.
 
 **Reproduce:** `docker build -t portunusmcp:dev .`, start Postgres/Redis, then run `UPSTREAM_RUNTIME_NAMESPACE=portunusmcp-benchmark .venv/bin/python -m tests.benchmarks.run` (wipes local dev state; reports land in gitignored `tests/benchmarks/reports/`).
 
-- **CI integration:** the benchmark suite runs on every merge to `main` (not every PR, to keep CI fast) and the report is uploaded as a build artifact so latency regressions are visible over time, even without a full dashboard.
+- **CI integration:** the benchmark suite runs at N=100 on every merge to `main`
+  (not every PR) and uploads its report. A numeric `workflow_dispatch` input supports
+  explicit N=1000 publication runs such as item 52.
 
 ---
 
@@ -633,7 +685,10 @@ None of this is built or load-tested at those scales for v1 — it's written her
 - **Unit:** policy resolution logic (RBAC + ABAC condition evaluation), duplicate identity/index rejection, schema hashing and diff classification, risk scoring function, param validator edge cases (nested objects, arrays, unicode).
 - **Integration:** spin up the gateway + a real (mock) MCP server in Compose, drive full `initialize → tools/list → tools/call` sequences via the actual MCP client SDK; prove failed credentials throttle only their resolved source and leave a victim source's live risk unchanged.
 - **Production Compose:** render the digest-only production contract, then use local-image test overrides to boot its core + monitoring services, assert isolation/hardening, and drive `initialize → tools/list → tools/call` through the real per-session container runtime.
-- **Operator lifecycle:** live tests cover approval/baseline list-detail-approve, policy validate/simulate/rollout/rollback, old-key-signed rotation, multi-key export verification, the installed CLI as a subprocess, and journal recovery boundaries.
+- **Operator lifecycle:** live tests cover approval/baseline list-detail-approve,
+  verified observe-audit scaffold generation, policy validate/simulate/rollout/
+  enforce-mode restart, old-key-signed rotation, multi-key export verification, the
+  installed CLI as a subprocess, and journal recovery boundaries.
 - **Resource/lifecycle:** `tests/integration/test_resource_limits.py` uses a tiny async sleep tool to cover declared and streamed body limits, JSON depth/encoding/model validation, SDK Host/Origin checks, session/in-flight/rate boundaries and failure semantics, deadline reaping, and in-flight idle heartbeats. `tests/unit/test_readiness.py` covers named dependency/signing failures and the one overall readiness deadline; metrics tests prove arbitrary denied names collapse to `tool="other"`.
 - **Adversarial suite (this is your differentiator in interviews):**
   - Simulate a rug pull at each severity tier: description-only change (should not block), required-field change (should block), tool rename (should block as new/unapproved) — assert correct classification and correct action per tier.
@@ -656,12 +711,12 @@ None of this is built or load-tested at those scales for v1 — it's written her
 ## 12. CI/CD Pipeline (GitHub Actions)
 
 ```
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
 jobs:
   lint:       ruff check, ruff format --check
   typecheck:  mypy --strict services/
   test:       pytest --cov=services --cov-fail-under=80
-  benchmark:  runs on merge to main only, uploads latency report artifact
+  benchmark:  N=100 on main; numeric N on manual dispatch; uploads report
   build:      docker build (multi-stage, non-root final image)
   release:    signed tag on main → multi-arch GHCR image + exact Compose bundle
               → fresh-host and persisted-state smoke → PyPI + latest + GitHub Release

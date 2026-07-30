@@ -91,6 +91,7 @@ graph TD
         Approvals["Approvals lifecycle (admin API)"]
         Explainer["Decision Explainer (admin API)"]
         Simulator["Policy Simulator (admin API)"]
+        Scaffolder["Policy Scaffolder (admin API)"]
     end
 
     UpClient --> Docker["Local Docker daemon"]
@@ -106,6 +107,7 @@ graph TD
     Approvals --> PG
     Explainer --> PG
     Simulator --> PG
+    Scaffolder --> PG
     Policy --> Rev["policy root: active file, staging journal, revision snapshots"]
     Simulator --> Rev
 
@@ -427,6 +429,9 @@ portunusmcp approvals list
 portunusmcp baselines list --kind all
 portunusmcp baselines show default send_email
 portunusmcp decisions get 42
+portunusmcp policy scaffold --from-audit \
+  --window 2026-07-01..2026-07-07 \
+  --output candidate.yaml
 portunusmcp policy validate candidate.yaml
 portunusmcp policy simulate candidate.yaml --window 2026-07-01..2026-07-27
 portunusmcp --yes policy rollout candidate.yaml
@@ -439,6 +444,16 @@ portunusmcp audit export --from-seq 1 --to-seq 500 --output audit.ndjson
 
 Mutations confirm interactively unless `--yes`; JSON-mode mutations require `--yes`. `--json` emits stable pretty JSON for automation. Plain HTTP is accepted only for `localhost`, `127.0.0.1`, or `::1`; remote operators must use HTTPS, optionally with `--ca-file`.
 
+The observe-mode adoption loop is deliberately explicit:
+**observe → scaffold → validate → simulate → rollout → restart in enforce mode**.
+Scaffolding verifies every signed audit row in the selected contiguous sequence span,
+then grants only the exact observed `(identity, server, tool)` triples. It retains
+registered servers, current admins, identity authentication/attributes, and protected
+repository patterns; static sensitivity and ABAC conditions are cleared and marked
+with `TODO(human)` comments. The output is a review artifact only: generation does not
+fully validate, simulate, activate, restart, or append an audit event. Drift, replay,
+parameter validation, and risk still apply independently at runtime.
+
 Policy rollout and rollback use one crash-recoverable journal: validate and preflight, record the revision, write the old-policy-signed `POLICY_ACTIVATED` handoff, atomically promote `policy.yaml`, then swap memory. SIGHUP follows the same path by consuming adjacent `policy.next.yaml`; a rejected candidate stays there for correction. Audit-key rotation similarly writes `AUDIT_KEY_ROTATED` with the old key before promoting the new private key. Historical public keys are fingerprint-addressed and retained so old rows remain verifiable.
 
 Approvals and flagged baselines are bounded review queues (100 rows per response). Audit export is verified before download and emits self-contained NDJSON: one manifest with the exact public-key bundle followed by inclusive, gap-free rows. A partial range proves its internal chain and signatures but explicitly does not attest the omitted prefix.
@@ -447,20 +462,45 @@ Approvals and flagged baselines are bounded review queues (100 rows per response
 
 ## Performance
 
-Measured, not estimated, on **2026-07-27** from the item-43 working tree based on **`98e4a80`**, with real per-session Docker upstreams and the full §4.2 pipeline plus item-40 edge/rate/deadline and item-43 source-auth controls active. Methodology, hardware, and reproduction steps: [`ARCHITECTURE.md` §9](./ARCHITECTURE.md#9-performance-benchmarks).
+Measured, not estimated, at **N=1000 on 2026-07-30 from item-52 commit
+`387d72b`**, with real per-session Docker upstreams and the full §4.2 pipeline.
+Methodology and reproduction steps: [`ARCHITECTURE.md` §9](./ARCHITECTURE.md#9-performance-benchmarks).
+
+**Local macOS arm64 — Darwin 24.6.0, Python 3.12.13; run
+`20260730T042941Z`.**
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 0.25 / 0.21 / 0.43 / 0.59 ms | 16.17 / 15.59 / 18.29 / 31.35 ms | 15.93 / 15.38 / 17.85 / 30.76 ms |
-| Single call, cold schema cache | 0.25 / 0.21 / 0.43 / 0.59 ms | 22.14 / 19.26 / 34.01 / 72.71 ms | — |
-| 10 concurrent sessions (p95) | — | 229.20 ms | — |
-| 50 concurrent sessions (p95) | — | 1171.36 ms | — |
-| 100 concurrent sessions (p95) | — | 5376.84 ms | — |
+| Single call, cached schema | 0.25 / 0.22 / 0.45 / 0.69 ms | 16.60 / 15.86 / 19.62 / 34.68 ms | 16.34 / 15.64 / 19.17 / 34.00 ms |
+| Single call, cold schema cache | 0.25 / 0.22 / 0.45 / 0.69 ms | 20.77 / 18.71 / 27.52 / 66.31 ms | — |
+| 10 concurrent sessions (p95) | — | 234.73 ms | — |
+| 50 concurrent sessions (p95) | — | 898.75 ms | — |
+| 100 concurrent sessions (p95) | — | 2636.79 ms | — |
 | `tools/list` payload (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
 
-Latencies are mean / p50 / p95 / p99. The high-concurrency p95 includes one hardened Docker container per session as well as the synchronous fail-closed audit write; both are known ceilings, discussed in `ARCHITECTURE.md` §10.
+Container initialization: first 426.66 ms; next 20 p50 331.40 ms / p95
+443.70 ms. Peak RSS was 149 MiB; initialized upstream containers used 1,095 MiB.
 
-Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms. Peak RSS after the 100-session run was 153 MiB (gateway + harness); initialized upstream containers used 1,095 MiB in aggregate.
+**GitHub-hosted Ubuntu x86_64 — Linux 6.17.0-1020-azure, Python 3.12.13;
+workflow run `30513931438`.**
+
+| Scenario | Direct call | Through gateway | Overhead |
+|---|---|---|---|
+| Single call, cached schema | 0.30 / 0.28 / 0.36 / 0.59 ms | 15.69 / 15.41 / 17.32 / 19.33 ms | 15.38 / 15.13 / 16.96 / 18.74 ms |
+| Single call, cold schema cache | 0.30 / 0.28 / 0.36 / 0.59 ms | 18.79 / 18.51 / 20.74 / 23.07 ms | — |
+| 10 concurrent sessions (p95) | — | 139.40 ms | — |
+| 50 concurrent sessions (p95) | — | 762.45 ms | — |
+| 100 concurrent sessions (p95) | — | 1534.57 ms | — |
+| `tools/list` payload (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
+
+Container initialization: first 308.77 ms; next 20 p50 322.21 ms / p95
+338.83 ms. Peak RSS was 243 MiB; initialized upstream containers used 1,087 MiB.
+
+Latencies are mean / p50 / p95 / p99. Against the previous like-for-like local
+publication, cached mean/p95 changed by +2.7%/+7.3%; all other comparable mean/p95
+metrics improved. No repeatable regression exceeded the 10% item-52 block threshold.
+High-concurrency p95 includes one hardened Docker container per session and the
+synchronous fail-closed audit write, both discussed in `ARCHITECTURE.md` §10.
 
 ---
 
@@ -491,7 +531,7 @@ Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms
 
 ## Roadmap
 
-Phases 1–6 and Phase 7 items 44–51 are complete. [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 52, `policy scaffold --from-audit`, is next.
+Phases 1–6 and Phase 7 items 44–52 are complete. [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 53, the demo screen recording, is next, and the five-adopter exit gate remains open.
 
 Items through Phase 6 are complete only when their verification passes and the corresponding threat-model claim is earned. Phase 7 verifies against observed friction; item 49's observe mode is the explicit exception that weakens and therefore qualifies existing threat-model claims. The phase closes after five outside users complete `quickstart` and their friction is triaged.
 

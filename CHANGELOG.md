@@ -21,6 +21,9 @@ All notable changes are documented here. The format follows
 - Added a non-root Python 3.12 devcontainer and Codespaces path that runs the existing
   quickstart automatically with a dedicated persisted Docker-in-Docker daemon and
   reuses generated state on rebuild.
+- Added `portunusmcp policy scaffold --from-audit` and the authenticated read-only
+  scaffold API, deriving exact observed RBAC grants from a verified observe-mode audit
+  span while leaving sensitivity and ABAC review explicit and separate from activation.
 
 ## [0.1.0] - 2026-07-27
 
