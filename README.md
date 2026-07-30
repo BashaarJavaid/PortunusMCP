@@ -491,7 +491,7 @@ Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms
 
 ## Roadmap
 
-Phases 1–6 and Phase 7 items 44–50 are complete. [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 51's implementation candidate has passed local macOS acceptance and is awaiting Codespaces acceptance before it can close.
+Phases 1–6 and Phase 7 items 44–51 are complete. [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 52, `policy scaffold --from-audit`, is next.
 
 Items through Phase 6 are complete only when their verification passes and the corresponding threat-model claim is earned. Phase 7 verifies against observed friction; item 49's observe mode is the explicit exception that weakens and therefore qualifies existing threat-model claims. The phase closes after five outside users complete `quickstart` and their friction is triaged.
 
