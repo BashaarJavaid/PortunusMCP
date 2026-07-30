@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,7 +76,8 @@ class AuditKeyStore:
         if path.exists():
             if path.read_bytes() != expected:
                 raise ValueError(f"public key file {path} does not match {key_id}")
-            path.chmod(0o444)
+            if stat.S_IMODE(path.stat().st_mode) != 0o444:
+                path.chmod(0o444)
             return path
         try:
             with path.open("xb") as stream:

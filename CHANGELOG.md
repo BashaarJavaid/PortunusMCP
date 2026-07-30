@@ -15,6 +15,9 @@ All notable changes are documented here. The format follows
   call pipeline, audits the earliest would-be Decision with downstream risk data, and
   forwards only after that audit succeeds; auth, resource/rate, deadline, upstream,
   and audit gates remain enforcing.
+- Added `portunusmcp doctor <deployment-dir> [--fix]` for production and quickstart
+  deployment diagnostics, bounded safe repairs, stable JSON findings, and explicit
+  restart verification.
 
 ## [0.1.0] - 2026-07-27
 

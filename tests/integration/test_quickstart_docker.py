@@ -60,6 +60,20 @@ def test_installed_quickstart_proves_allow_and_deny(tmp_path: Path) -> None:
             key = line.split("=", 1)[1]
             assert key not in result.stdout
             assert key not in result.stderr
+        diagnosed = subprocess.run(
+            [str(cli), "--json", "doctor", str(output)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert diagnosed.returncode == 0, diagnosed.stderr or diagnosed.stdout
+        report = json.loads(diagnosed.stdout)
+        assert report["deployment"]["kind"] == "quickstart"
+        assert report["summary"]["healthy"] is True
+        assert any(
+            finding["id"] == "runtime.readiness" and finding["status"] == "PASS"
+            for finding in report["findings"]
+        )
     finally:
         if (output / ".env.quickstart").is_file():
             env = output / ".env.quickstart"

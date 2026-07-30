@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from services import quickstart
+from services import doctor, quickstart
 from services.gateway.audit_export import verify_file
 
 VERSION = "0.1.0"
@@ -177,6 +177,9 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="upstream argv; must be the final option",
     )
+    diagnose = groups.add_parser("doctor")
+    diagnose.add_argument("deployment_dir")
+    diagnose.add_argument("--fix", action="store_true")
     return parser
 
 
@@ -319,6 +322,8 @@ def _export(args: argparse.Namespace, client: Client) -> dict[str, Any]:
 
 
 def _human(result: Any, args: argparse.Namespace) -> str:
+    if args.group == "doctor":
+        return doctor.human(result)
     if args.group == "quickstart":
         return quickstart.human(result)
     if args.group == "keys" and args.action == "generate":
@@ -344,7 +349,9 @@ def main(argv: list[str] | None = None) -> int:
     args: argparse.Namespace | None = None
     try:
         args = parser.parse_args(argv)
-        if args.group == "quickstart":
+        if args.group == "doctor":
+            result = doctor.run(args)
+        elif args.group == "quickstart":
             result = quickstart.run(args)
         elif args.group == "keys" and args.action == "generate":
             result = _generate(args)
@@ -366,6 +373,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.json
             else _human(result, args)
         )
+        if args.group == "doctor":
+            return 0 if result["summary"]["healthy"] else 1
         return 0
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
@@ -373,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
     except quickstart.QuickstartUsageError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    except (CLIError, quickstart.QuickstartError, OSError, ValueError) as exc:
+    except (CLIError, doctor.DoctorError, quickstart.QuickstartError, OSError, ValueError) as exc:
         if args is not None and args.json and args.group != "quickstart":
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2, sort_keys=True))
         else:

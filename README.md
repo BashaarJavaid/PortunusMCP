@@ -216,6 +216,42 @@ hardened, operator-configured [`compose.prod.yml`](./compose.prod.yml).
 
 ---
 
+## Diagnose a deployment
+
+Run `doctor` from a generated quickstart directory or a production bundle directory:
+
+```bash
+portunusmcp doctor .
+portunusmcp doctor . --fix
+```
+
+It checks the local Docker socket and tested version lines, Compose rendering, socket
+GID and runtime namespace, policy/audit-key paths and modes, the complete fingerprinted
+public-key ring, policy-referenced gateway environment variables, immutable locally
+available upstream images, named volumes, loopback ports, `FORWARDED_ALLOW_IPS`, and
+`/ready` when the gateway is running. A stopped stack is informational, not unhealthy.
+
+`--fix` offers only unambiguous local repairs: mode-`0700` directories, mode-`0600`
+private/config files, mode-`0444` archived public keys, pristine initial audit keys, a
+missing active public archive, and exactly inferable Docker GID or namespace values.
+It prompts once; automation must put the global flags before the command:
+
+```bash
+portunusmcp --yes doctor . --fix
+portunusmcp --json --yes doctor . --fix
+```
+
+Exit status is `0` when no `ERROR` remains and `1` otherwise; warnings do not fail the
+run. Repairs that affect an existing stack do not restart it. Doctor exits unhealthy
+and prints the exact `docker compose ... --force-recreate gateway verifier` command to
+run, after which a second `doctor` verifies readiness. Missing secrets, ambiguous
+namespaces, ownership changes, unavailable images, missing volumes, port conflicts,
+and corrupt or historically incomplete key material remain explicit operator
+decisions; doctor never guesses, pulls images, creates volumes, or uses ambient secret
+environment variables to hide a missing deployment value.
+
+---
+
 ## Run the demo
 
 ```bash
@@ -404,7 +440,7 @@ Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms
 
 ## Roadmap
 
-Phases 1–6 are complete. The Phase 7 blockers (items 44–47) are also complete: [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 48, `portunusmcp quickstart`, is next.
+Phases 1–6 and Phase 7 items 44–50 are complete. [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 51, the devcontainer/Codespaces path, is next.
 
 Items through Phase 6 are complete only when their verification passes and the corresponding threat-model claim is earned. Phase 7 verifies against observed friction; item 49's observe mode is the explicit exception that weakens and therefore qualifies existing threat-model claims. The phase closes after five outside users complete `quickstart` and their friction is triaged.
 
