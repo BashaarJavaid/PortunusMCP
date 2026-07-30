@@ -462,45 +462,48 @@ Approvals and flagged baselines are bounded review queues (100 rows per response
 
 ## Performance
 
-Measured, not estimated, at **N=1000 on 2026-07-30 from item-52 commit
-`387d72b`**, with real per-session Docker upstreams and the full §4.2 pipeline.
+Measured, not estimated, at **N=1000 on 2026-07-30 from implementation commit
+`dbae28124b26a3a51fbb029ef57e384e44a29bc8`**, with real per-session Docker
+upstreams on the gateway path and the full §4.2 pipeline.
 Methodology and reproduction steps: [`ARCHITECTURE.md` §9](./ARCHITECTURE.md#9-performance-benchmarks).
 
 **Local macOS arm64 — Darwin 24.6.0, Python 3.12.13; run
-`20260730T042941Z`.**
+`20260730T052023Z`.**
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 0.25 / 0.22 / 0.45 / 0.69 ms | 16.60 / 15.86 / 19.62 / 34.68 ms | 16.34 / 15.64 / 19.17 / 34.00 ms |
-| Single call, cold schema cache | 0.25 / 0.22 / 0.45 / 0.69 ms | 20.77 / 18.71 / 27.52 / 66.31 ms | — |
-| 10 concurrent sessions (p95) | — | 234.73 ms | — |
-| 50 concurrent sessions (p95) | — | 898.75 ms | — |
-| 100 concurrent sessions (p95) | — | 2636.79 ms | — |
+| Single call, cached schema | 0.26 / 0.21 / 0.46 / 1.04 ms | 16.04 / 15.53 / 18.22 / 27.81 ms | 15.78 / 15.32 / 17.76 / 26.77 ms |
+| Single call, cold schema cache | 0.26 / 0.21 / 0.46 / 1.04 ms | 19.04 / 18.40 / 21.69 / 33.38 ms | 18.78 / 18.19 / 21.23 / 32.34 ms |
+| 10 concurrent sessions | 1.26 / 1.12 / 1.93 / 2.05 ms | 76.29 / 66.82 / 103.48 / 196.50 ms | 75.03 / 65.70 / 101.55 / 194.44 ms |
+| 50 concurrent sessions | 10.43 / 5.38 / 76.76 / 88.29 ms | 578.22 / 508.65 / 857.25 / 1874.82 ms | 567.79 / 503.27 / 780.49 / 1786.53 ms |
+| 100 concurrent sessions | 15.18 / 12.13 / 26.56 / 65.17 ms | 1450.36 / 1398.24 / 2053.76 / 3453.88 ms | 1435.18 / 1386.11 / 2027.20 / 3388.71 ms |
 | `tools/list` payload (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
 
-Container initialization: first 426.66 ms; next 20 p50 331.40 ms / p95
-443.70 ms. Peak RSS was 149 MiB; initialized upstream containers used 1,095 MiB.
+Container initialization: first 504.22 ms; next 20 p50 327.70 ms / p95
+402.78 ms. Peak RSS was 179 MiB; initialized upstream containers used 1,095 MiB.
 
-**GitHub-hosted Ubuntu x86_64 — Linux 6.17.0-1020-azure, Python 3.12.13;
-workflow run `30513931438`.**
+**GitHub-hosted Ubuntu 24.04 x86_64 — Linux 6.17.0-1020-azure, Python
+3.12.13; workflow run `30516344641`, report `20260730T052354Z`.**
 
 | Scenario | Direct call | Through gateway | Overhead |
 |---|---|---|---|
-| Single call, cached schema | 0.30 / 0.28 / 0.36 / 0.59 ms | 15.69 / 15.41 / 17.32 / 19.33 ms | 15.38 / 15.13 / 16.96 / 18.74 ms |
-| Single call, cold schema cache | 0.30 / 0.28 / 0.36 / 0.59 ms | 18.79 / 18.51 / 20.74 / 23.07 ms | — |
-| 10 concurrent sessions (p95) | — | 139.40 ms | — |
-| 50 concurrent sessions (p95) | — | 762.45 ms | — |
-| 100 concurrent sessions (p95) | — | 1534.57 ms | — |
+| Single call, cached schema | 0.31 / 0.31 / 0.37 / 0.56 ms | 15.13 / 14.97 / 15.80 / 18.92 ms | 14.82 / 14.66 / 15.44 / 18.36 ms |
+| Single call, cold schema cache | 0.31 / 0.31 / 0.37 / 0.56 ms | 17.64 / 17.37 / 19.12 / 21.43 ms | 17.33 / 17.06 / 18.75 / 20.87 ms |
+| 10 concurrent sessions | 2.50 / 2.49 / 2.59 / 3.41 ms | 126.69 / 124.53 / 133.87 / 221.50 ms | 124.19 / 122.04 / 131.28 / 218.09 ms |
+| 50 concurrent sessions | 10.81 / 10.62 / 13.06 / 13.65 ms | 689.45 / 652.20 / 777.93 / 1407.16 ms | 678.64 / 641.59 / 764.87 / 1393.51 ms |
+| 100 concurrent sessions | 21.30 / 21.22 / 21.95 / 22.19 ms | 1387.19 / 1309.17 / 1436.30 / 3182.54 ms | 1365.88 / 1287.94 / 1414.35 / 3160.35 ms |
 | `tools/list` payload (pruned identity) | 744 B (unpruned) | 425 B | **42.9% reduction** |
 
-Container initialization: first 308.77 ms; next 20 p50 322.21 ms / p95
-338.83 ms. Peak RSS was 243 MiB; initialized upstream containers used 1,087 MiB.
+Container initialization: first 299.46 ms; next 20 p50 307.96 ms / p95
+341.66 ms. Peak RSS was 216 MiB; initialized upstream containers used 1,087 MiB.
 
-Latencies are mean / p50 / p95 / p99. Against the previous like-for-like local
-publication, cached mean/p95 changed by +2.7%/+7.3%; all other comparable mean/p95
-metrics improved. No repeatable regression exceeded the 10% item-52 block threshold.
-High-concurrency p95 includes one hardened Docker container per session and the
-synchronous fail-closed audit write, both discussed in `ARCHITECTURE.md` §10.
+Latencies are mean / p50 / p95 / p99. Each overhead value subtracts the matching
+statistics of independently summarized gateway and direct distributions; it is not a
+percentile of paired per-call differences. Against item 52, every like-for-like local
+gateway mean/p95 improved: cached by 3.3%/7.2%, cold by 8.4%/21.2%, and concurrent
+values by 4.6%–55.9%. No regression crossed the 10% publication block threshold.
+High-concurrency latency includes one hardened Docker container per gateway session
+and the synchronous fail-closed audit write, both discussed in `ARCHITECTURE.md` §10.
 
 ---
 
