@@ -19,6 +19,30 @@ The supported deployment is the bundled, single-host, single-gateway-replica pro
 Compose profile. Multiple gateway replicas, Kubernetes, remote network upstreams, and
 in-place database downgrades are not supported in v0.1.0.
 
+## Unreleased adoption path — 2026-07-29
+
+The item-51 implementation candidate adds one devcontainer definition for default
+2-core GitHub Codespaces on Linux amd64 and local VS Code Dev Containers on macOS
+arm64. It pins the Python 3.12 Bookworm base image and Docker-in-Docker feature digest,
+installs Moby Engine 29.6.2, and lets that feature resolve current Compose. The
+post-create lifecycle runs the released quickstart proof within one 600-second budget
+and reuses generated namespace, credentials, keys, and volumes on rebuild.
+
+This is unreleased adoption evidence, not a change to the v0.1.0 support matrix above.
+Required Codespaces evidence remains pending before roadmap item 51 can close.
+
+Local editor acceptance passed on macOS 15.7.3 arm64 with VS Code 1.131.0,
+Dev Containers 0.466.0 (CLI 0.88.0), Python 3.12.13, Moby 29.6.2-1, and Compose
+5.3.1. From a fresh workspace it completed in 125.79 seconds (quickstart: 47.949
+seconds), produced canonical `ALLOW` and `DENY_RBAC`, and passed doctor with 38
+`PASS` findings. A true container rebuild completed in 18.75 seconds with namespace
+`portunusmcp-quickstart-d97dd0ac` and credential-file SHA-256
+`b785e354d8ff6cbc5b2c3faf67751fb292f39d723b97f3e0591251d5cc6b2dce`
+unchanged; stop/resume restored `/ready` in 8 seconds without a post-start hook.
+The earlier VS Code 1.99.3 / Dev Containers 0.422.1 runtime stalled before
+`postCreateCommand`; upgrading the editor and extension resolved that compatibility
+failure. Candidate and default-branch Codespaces acceptance remain open.
+
 ## Client evidence
 
 Bearer mode requires a remote MCP client that can attach `X-PortunusMCP-Key`. The exact

@@ -1,0 +1,36 @@
+{
+  "name": "PortunusMCP",
+  "image": "mcr.microsoft.com/devcontainers/python:3.1.5-3.12-bookworm@sha256:6ef67a2f0d2f054ad60990679e15208367ff10110a0c0be7f18dbaa7b7319d1d",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:4.0.0": {
+      "version": "29.6.2",
+      "moby": true,
+      "dockerDashComposeVersion": "latest"
+    }
+  },
+  "remoteUser": "vscode",
+  "remoteEnv": {
+    "PATH": "${containerWorkspaceFolder}/.venv/bin:${containerEnv:PATH}"
+  },
+  "postCreateCommand": [
+    "bash",
+    ".devcontainer/post-create.sh"
+  ],
+  "waitFor": "postCreateCommand",
+  "forwardPorts": [
+    8000
+  ],
+  "portsAttributes": {
+    "8000": {
+      "label": "PortunusMCP Gateway",
+      "onAutoForward": "silent"
+    }
+  },
+  "customizations": {
+    "codespaces": {
+      "openFiles": [
+        "README.md"
+      ]
+    }
+  }
+}

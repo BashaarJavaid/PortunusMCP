@@ -157,6 +157,57 @@ The full version, including the assumptions the whole model rests on, is in [`TH
 
 ## Quickstart
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/BashaarJavaid/PortunusMCP?ref=main&quickstart=1)
+
+### Devcontainer and Codespaces
+
+GitHub Codespaces needs no local install: use the badge and wait for creation to finish.
+For local use, install only Docker, VS Code, and the Dev Containers extension, then run
+**Dev Containers: Reopen in Container**. Both paths start a non-root Python 3.12
+workspace, a dedicated Docker-in-Docker daemon, and this repository's existing
+quickstart against the harmless `read_file` sample. Creation succeeds only after the
+log contains canonical `ALLOW` and `DENY_RBAC` Decisions, a verified audit export, and
+a healthy `doctor` result.
+
+Generated state stays in the ignored `./portunusmcp-quickstart/` directory. Rebuilding
+the devcontainer reuses its namespace, credentials, keys, and database volumes; the
+post-create script never repairs or destroys existing state. Load credentials without
+printing them:
+
+```bash
+cd ./portunusmcp-quickstart
+set -a && source ./credentials.env && set +a
+```
+
+If creation fails, its final output includes doctor findings and exact commands. The
+equivalent state-preserving recovery and explicit destructive reset are:
+
+```bash
+state=./portunusmcp-quickstart
+project="$(awk -F"'" '/^QUICKSTART_NAMESPACE=/{print $2}' "$state/.env.quickstart")"
+docker compose --env-file "$state/.env.quickstart" -p "$project" \
+  -f "$state/compose.quickstart.yml" up -d --wait --pull never
+portunusmcp doctor "$state"
+
+# Destructive: delete the generated named volumes, then the generated files.
+docker compose --env-file "$state/.env.quickstart" -p "$project" \
+  -f "$state/compose.quickstart.yml" down --volumes
+rm -rf -- ./portunusmcp-quickstart
+```
+
+Port 8000 is forwarded silently and remains private by default. In browser Codespaces,
+use loopback from the integrated terminal (for example,
+`curl http://127.0.0.1:8000/ready`): the authenticated `*.app.github.dev` hostname is
+deliberately outside quickstart's Host allowlist. Local VS Code can use its
+`localhost:8000` tunnel.
+
+The Docker-in-Docker feature runs the devcontainer privileged, and its Docker daemon
+gives the workspace root-equivalent control of that environment. Only open trusted
+repository code and use trusted upstream images; `postCreateCommand` runs repository
+code automatically.
+
+### Existing Python and Docker
+
 `portunusmcp quickstart` is the evaluation path from an existing local stdio MCP image
 to one verified `ALLOW` and one verified `DENY_RBAC`. It creates and starts the real
 PostgreSQL, Redis, migration, gateway, and audit-verifier stack; it is not a
@@ -440,7 +491,7 @@ Container initialization: first 899.89 ms; next 20 p50 338.03 ms / p95 802.46 ms
 
 ## Roadmap
 
-Phases 1–6 and Phase 7 items 44–50 are complete. [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 51, the devcontainer/Codespaces path, is next.
+Phases 1–6 and Phase 7 items 44–50 are complete. [`v0.1.0`](https://github.com/BashaarJavaid/PortunusMCP/releases/tag/v0.1.0) is available from GitHub Releases and [PyPI](https://pypi.org/project/portunusmcp/0.1.0/), and GHCR tags `0.1.0` and `latest` resolve to the tested linux/amd64 + linux/arm64 image index `sha256:fdbfb388e68830fb6dff44c285fb0b3b43633113e586c448ab3e76abd6811073`. Phase 7 remains active; item 51's implementation candidate has passed local macOS acceptance and is awaiting Codespaces acceptance before it can close.
 
 Items through Phase 6 are complete only when their verification passes and the corresponding threat-model claim is earned. Phase 7 verifies against observed friction; item 49's observe mode is the explicit exception that weakens and therefore qualifies existing threat-model claims. The phase closes after five outside users complete `quickstart` and their friction is triaged.
 

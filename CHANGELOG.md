@@ -18,6 +18,9 @@ All notable changes are documented here. The format follows
 - Added `portunusmcp doctor <deployment-dir> [--fix]` for production and quickstart
   deployment diagnostics, bounded safe repairs, stable JSON findings, and explicit
   restart verification.
+- Added a non-root Python 3.12 devcontainer and Codespaces path that runs the existing
+  quickstart automatically with a dedicated persisted Docker-in-Docker daemon and
+  reuses generated state on rebuild.
 
 ## [0.1.0] - 2026-07-27
 

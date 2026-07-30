@@ -9,6 +9,29 @@ on:
   pull_request:
 
 jobs:
+  devcontainer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: devcontainers/ci@v0.3
+        with:
+          push: never
+          runCmd: |
+            set -euo pipefail
+            state=portunusmcp-quickstart
+            namespace_before="$(sed -n "s/^QUICKSTART_NAMESPACE='\([^']*\)'$/\1/p" "$state/.env.quickstart")"
+            credentials_before="$(sha256sum "$state/credentials.env" | cut -d ' ' -f 1)"
+            .devcontainer/post-create.sh
+            namespace_after="$(sed -n "s/^QUICKSTART_NAMESPACE='\([^']*\)'$/\1/p" "$state/.env.quickstart")"
+            credentials_after="$(sha256sum "$state/credentials.env" | cut -d ' ' -f 1)"
+            test -n "$namespace_before"
+            test "$namespace_before" = "$namespace_after"
+            test "$credentials_before" = "$credentials_after"
+            .venv/bin/portunusmcp --json doctor "$state" > /tmp/doctor.json
+            .venv/bin/python -c 'import json; report=json.load(open("/tmp/doctor.json")); assert report["summary"]["ERROR"] == 0; assert any(item["id"] == "runtime.readiness" and item["status"] == "PASS" for item in report["findings"])'
+            git diff --exit-code -- .devcontainer/devcontainer-lock.json
+
   lint:
     runs-on: ubuntu-latest
     steps:
