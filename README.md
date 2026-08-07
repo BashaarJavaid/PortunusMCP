@@ -538,6 +538,29 @@ Phases 1–6 and Phase 7 items 44–52 are complete. [`v0.1.0`](https://github.c
 
 Items through Phase 6 are complete only when their verification passes and the corresponding threat-model claim is earned. Phase 7 verifies against observed friction; item 49's observe mode is the explicit exception that weakens and therefore qualifies existing threat-model claims. The phase closes after five outside users complete `quickstart` and their friction is triaged.
 
+## How this was built
+
+PortunusMCP was built by one engineer working with AI coding assistants, and the
+split is worth stating plainly.
+
+The design decisions are the human's: what the gateway does and deliberately does not
+cover, the threat model and its honest **No** rows, the decision pipeline, the
+fail-closed posture, the choice to keep the policy DSL non-Turing-complete and the risk
+engine free of ML, and every rejected alternative recorded in [`docs/adr/`](./docs/adr/).
+The phase gates are the human's too — including the rule that a `THREAT_MODEL.md` claim
+may not move until the code that earns it exists and its check passes.
+
+The assistants did the implementation downstream of those decisions: writing the
+modules, the migrations, the test suites, the Compose profiles, and the documentation,
+and doing the debugging. [`CLAUDE.md`](./CLAUDE.md) is the standing instruction file
+that constrains how they work here — surface assumptions, no speculative complexity, no
+unrelated edits, explicit success criteria per task.
+
+Nothing in this README is asserted on a model's say-so. Benchmarks carry their commit,
+date, hardware, and run ID; compatibility results carry the client version and what was
+observed; the audit chain is independently verifiable with
+`scripts/verify_audit_chain.py`. Where something is unproven or unprotected, it says so.
+
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).
